@@ -1,8 +1,8 @@
+use core::f64;
 use std::f64::consts::PI;
 
 use integrate::adaptive_quadrature;
-use libm::log10;
-use libm::sinh;
+use libm::{asin, asinh, log10, sinh};
 use roots::SimpleConvergency;
 use roots::find_root_brent;
 
@@ -136,6 +136,25 @@ impl Cosmology {
     pub fn differential_comoving_distance(&self, z: f64) -> f64 {
         let dm = self.comoving_transverse_distance(z);
         self.hubble_distance() * dm.powi(2) / (self.e_func(z))
+    }
+
+    /// The comoving volume at a redshift z.
+    /// Returns Mpc^3.
+    pub fn comoving_volume(&self, z: f64) -> f64 {
+        if self.omega_k == 0. {
+            (4. / 3.) * f64::consts::PI * self.comoving_distance(z).powi(3)
+        } else {
+            let dh = self.hubble_distance();
+            let dm = self.comoving_transverse_distance(z);
+            let term1 = 4. * f64::consts::PI * (dh.powi(3)) / (2. * self.omega_k);
+            let term2 = dm / dh * (1. + self.omega_k * (dm / dh).powi(2)).sqrt();
+            let term3 = self.omega_k.abs().sqrt() * dm / dh;
+            if self.omega_k > 0. {
+                term1 * (term2 - 1. / self.omega_k.abs().sqrt()) * asinh(term3)
+            } else {
+                term1 * (term2 - 1. / self.omega_k.abs().sqrt()) * asin(term3)
+            }
+        }
     }
 }
 
@@ -289,8 +308,14 @@ mod tests {
             h0: 100.,
         };
         let redshifts = [0.01, 0.1, 0.2, 1., 2., 5.];
-        let answers = [2.67015438e+06, 2.45332525e+08, 8.87711128e+08,
-           9.10690921e+09, 1.32865381e+10, 1.09733269e+10];
+        let answers = [
+            2.67015438e+06,
+            2.45332525e+08,
+            8.87711128e+08,
+            9.10690921e+09,
+            1.32865381e+10,
+            1.09733269e+10,
+        ];
         let results = redshifts
             .iter()
             .map(|&z| cosmo.differential_comoving_distance(z))
@@ -298,9 +323,41 @@ mod tests {
         for (r, a) in zip(results, answers) {
             dbg!(r);
             dbg!(a);
-            assert!(((r/a) - 1.).abs() < 1e-5)
+            assert!(((r / a) - 1.).abs() < 1e-5)
         }
         // check z=0 edge case
         assert_eq!(cosmo.differential_comoving_distance(0.), 0.)
+    }
+
+    #[test]
+    fn testing_comoving_volume() {
+        // test omegak=0
+        let cosmo = Cosmology {
+            omega_m: 0.3,
+            omega_k: 0.,
+            omega_l: 0.7,
+            h0: 100.,
+        };
+        let redshifts = [0.01, 0.1, 0.2, 1., 2., 5.];
+        let answers = [
+            1.12101039e+05,
+            1.05275526e+08,
+            7.82721871e+08,
+            5.18125940e+10,
+            1.99681264e+11,
+            6.75376595e+11,
+        ];
+        let results = redshifts
+            .iter()
+            .map(|&z| cosmo.comoving_volume(z))
+            .collect::<Vec<f64>>();
+        for (r, a) in zip(results, answers) {
+            assert!(((r / a) - 1.).abs() < 1e-5)
+        }
+
+        // test z=0 edge case
+        assert_eq!(cosmo.comoving_volume(0.), 0.)
+
+        // TODO: add OmK>0 OmK < 0
     }
 }

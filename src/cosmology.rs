@@ -8,6 +8,19 @@ use roots::find_root_brent;
 
 use crate::constants::{G, KM_TO_METERS, MPC_TO_METERS, MSOL_TO_KG, PC_TO_METERS, SPEED_OF_LIGHT};
 
+/// Determines the zero point of the root function. This can be used to calcualte the inverse
+/// of cosmological properties, i.e., the z value at which they occur.
+fn inverse(root_function: impl Fn(f64) -> f64) -> f64 {
+    let mut convergency = SimpleConvergency {
+        eps: 1e-8f64,
+        max_iter: 30,
+    };
+    match find_root_brent(1e-9, 1200., &root_function, &mut convergency) {
+        Ok(t) => t,
+        Err(_error) => 0.0,
+    }
+}
+
 /// A Flat lambda CDM cosmology object.
 /// @param redshift_array an array of multiple redshift values.
 /// @param omega_m Mass density (often 0.3 in LCDM).
@@ -80,14 +93,7 @@ impl Cosmology {
     /// The redshift at a given co-moving distance.
     pub fn inverse_codist(&self, distance: f64) -> f64 {
         let f = |z: f64| self.comoving_distance(z) - distance;
-        let mut convergency = SimpleConvergency {
-            eps: 1e-8f64,
-            max_iter: 30,
-        };
-        match find_root_brent(1e-9, 1200., &f, &mut convergency) {
-            Ok(t) => t,
-            Err(_error) => 0.0,
-        }
+        inverse(f)
     }
 
     /// comoving transverse distance at a given redshift. This is just the comoving distance when k = 0.
@@ -161,14 +167,19 @@ impl Cosmology {
     /// Returns redshift.
     pub fn inverse_covol(&self, comoving_volume: f64) -> f64 {
         let f = |z: f64| self.comoving_volume(z) - comoving_volume;
-        let mut convergency = SimpleConvergency {
-            eps: 1e-8f64,
-            max_iter: 30,
-        };
-        match find_root_brent(1e-9, 1200., &f, &mut convergency) {
-            Ok(t) => t,
-            Err(_error) => 0.0,
-        }
+        inverse(f)
+    }
+
+    /// The luminosity distance at a redshift z.
+    /// Returns the luminosity distance in Mpc^3
+    pub fn luminosity_distance(&self, z: f64) -> f64 {
+        (1. + z) * self.comoving_transverse_distance(z)
+    }
+
+    /// The redshift for a given luminosity distance in Mpc
+    pub fn inverse_lumdist(&self, luminosity_distance: f64) -> f64 {
+        let f = |z: f64| self.luminosity_distance(z) - luminosity_distance;
+        inverse(f)
     }
 }
 
@@ -396,4 +407,55 @@ mod tests {
             assert!((r - a).abs() < 1e-5)
         }
     }
+
+    #[test]
+    fn test_luminosity_distance() {
+        let cosmo = Cosmology {
+            omega_m: 0.3,
+            omega_k: 0.,
+            omega_l: 0.7,
+            h0: 100.,
+        };
+        let answers = [
+            3.02107646e+01,
+            3.22209955e+02,
+            6.86047521e+02,
+            4.62536033e+03,
+            1.08777104e+04,
+            3.26565561e+04,
+        ];
+        let redshifts = [0.01, 0.1, 0.2, 1., 2., 5.];
+        let results = redshifts
+            .iter()
+            .map(|&z| cosmo.luminosity_distance(z))
+            .collect::<Vec<f64>>();
+        for (r, a) in zip(results, answers) {
+            dbg!(r);
+            dbg!(a);
+            assert!((r - a).abs() < 1e-1)
+        }
+
+        //test z = 0
+        assert_eq!(cosmo.luminosity_distance(0.), 0.)
+    }
+
+    #[test]
+    fn testing_inverse_luminosity_distance() {
+                let cosmo = Cosmology {
+            omega_m: 0.3,
+            omega_k: 0.,
+            omega_l: 0.7,
+            h0: 100.,
+        };
+        let redshifts = [0.01, 0.1, 0.2, 1., 2., 5.];
+        let calced_distanced = redshifts
+            .iter()
+            .map(|&z| cosmo.luminosity_distance(z))
+            .collect::<Vec<f64>>();
+        
+        let results: Vec<f64> = calced_distanced.iter().map(|&d| cosmo.inverse_lumdist(d)).collect();
+        for (r, a) in zip(results, redshifts) {
+            assert!((r-a).abs() < 1e-5)
+        }
+    }   
 }

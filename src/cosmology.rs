@@ -156,6 +156,20 @@ impl Cosmology {
             }
         }
     }
+
+    /// Inverse comoving volume. The redshift at some volume in Mpc^3.
+    /// Returns redshift.
+    pub fn inverse_covol(&self, comoving_volume: f64) -> f64 {
+        let f = |z: f64| self.comoving_volume(z) - comoving_volume;
+        let mut convergency = SimpleConvergency {
+            eps: 1e-8f64,
+            max_iter: 30,
+        };
+        match find_root_brent(1e-9, 1200., &f, &mut convergency) {
+            Ok(t) => t,
+            Err(_error) => 0.0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -359,5 +373,27 @@ mod tests {
         assert_eq!(cosmo.comoving_volume(0.), 0.)
 
         // TODO: add OmK>0 OmK < 0
+    }
+
+    #[test]
+    fn test_inverse_comoving() {
+        let cosmo = Cosmology {
+            omega_m: 0.3,
+            omega_k: 0.,
+            omega_l: 0.7,
+            h0: 100.,
+        };
+        let redshifts = [0.01, 0.1, 0.2, 1., 2., 5.];
+        let calced_volumes = redshifts
+            .iter()
+            .map(|&z| cosmo.comoving_volume(z))
+            .collect::<Vec<f64>>();
+        let results = calced_volumes
+            .iter()
+            .map(|&v| cosmo.inverse_covol(v))
+            .collect::<Vec<f64>>();
+        for (r, a) in zip(results, redshifts) {
+            assert!((r - a).abs() < 1e-5)
+        }
     }
 }

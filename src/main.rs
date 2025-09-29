@@ -2,6 +2,7 @@ pub mod constants;
 pub mod cosmology;
 pub mod histogram;
 
+use csv::Writer;
 use integrate::adaptive_quadrature;
 use interp::{InterpMode, interp};
 use libm::log10;
@@ -19,17 +20,39 @@ use crate::histogram::{arange, calculate_fd, histogram};
 fn calculate_max_z(mag: f64, z: f64, mag_lim: f64, cosmo: &Cosmology) -> f64 {
     let distance_measured = cosmo.luminosity_distance(z) * 1e6; // Mpc to pc
     let max_distance = 10_f64.powf((mag_lim - mag + 5. * log10(distance_measured)) / 5.);
-    cosmo.inverse_lumdist(max_distance)
+    cosmo.inverse_lumdist(max_distance/1e6) // back to Mpc
 }
+
+fn fast_rough_integral<F: Fn(f64) -> f64 + Sync>(function: F, limit: f64) -> f64 {
+    let bin_size = 0.0001;
+    println!("Getting Here");
+    let xs = arange(0., limit, bin_size);
+    println!("Done Here");
+    let ys: Vec<f64> = xs.iter().map(|&b| function(b)).collect();
+    ys.into_iter().sum::<f64>() * bin_size
+}
+
 
 /// Calculates the density corrected volume based on the given overdensity function delta_z
 fn calculate_v_dc_max<F: Fn(f64) -> f64 + Sync>(z_max: f64, delta_z: F, cosmo: &Cosmology) -> f64 {
     let integrand = |z: f64| delta_z(z) * cosmo.differential_comoving_distance(z);
-    let tolerance = 1e-5;
-    let min_h = 1e-7;
-    let v_dc =
-        adaptive_quadrature::adaptive_simpson_method(integrand, 0.0, z_max, min_h, tolerance)
-            .expect("Value too close to zero. Must be within 10e-8");
+    // testing
+    let redshifts = arange(0., 1., 0.01);
+    let integrands: Vec<f64> = redshifts.iter().map(|&z| integrand(z)).collect();
+    let file = File::create("delete_integral.csv").unwrap();
+    let mut wtr = Writer::from_writer(file);
+    for (x, y) in redshifts.iter().zip(integrands.iter()) {
+        wtr.write_record(&[x.to_string(), y.to_string()]).unwrap();
+    }
+    wtr.flush().unwrap();
+    //
+    //let tolerance = 1e-5;
+    //let min_h = 1e-7;
+    let v_dc = fast_rough_integral(integrand, z_max);
+    // println!("Zmax thing: {}", z_max);
+    // let v_dc =
+    //     adaptive_quadrature::adaptive_simpson_method(integrand, 1e-3, z_max, min_h, tolerance)
+    //         .unwrap();
     v_dc * 4. * PI
 }
 
@@ -61,7 +84,7 @@ fn populate_volume(z: f64, z_max: f64, n_points: f64, cosmo: &Cosmology) -> Vec<
 
     let normal = Normal::new(volume, sigma_vol).unwrap();
     let mut counter = 0.;
-
+    
     while counter < n_points {
         let v = normal.sample(&mut rand::rng());
         if (v < max_vol) && (v > min_vol) {
@@ -124,7 +147,7 @@ fn main() -> PolarsResult<()> {
     //read in file
     let df = read_gama(file_name)?;
     let redshifts = df
-        .column("z")?
+        .column("Z")?
         .f64()?
         .into_no_null_iter()
         .collect::<Vec<f64>>();
@@ -134,33 +157,35 @@ fn main() -> PolarsResult<()> {
         .f64()?
         .into_no_null_iter()
         .collect::<Vec<f64>>();
-
+    println!("Here");
     let bin_width = calculate_fd(redshifts.clone());
 
     let max_z = 1.; //TODO: How do we fix this thing.
     let redshift_bins = arange(0., max_z, bin_width);
-
+    println!("bins done");
     let max_zs = redshifts
         .clone()
         .iter()
         .zip(mags)
         .map(|(&z, m)| calculate_max_z(m, z, maglim, &cosmo))
         .collect::<Vec<f64>>();
-
+    println!("Max Zs done");
+    //println!("{:?}", max_zs);
     let randoms: Vec<f64> = redshifts
         .iter()
         .zip(max_zs.clone())
         .flat_map(|(&z, max_z)| populate_volume(z, max_z, n_clone, &cosmo))
         .collect();
-
+    println!("randoms done");
     let v_maxes = max_zs
         .clone()
         .iter()
         .map(|&z| cosmo.comoving_volume(z))
         .collect::<Vec<f64>>();
-
+    println!("v_maxes done");
     let mut counter = 1;
     while counter < 15 {
+        println!("counter");
         let x_values = approximate_delta_x(redshift_bins.clone());
         let y_values = approximate_delta_y(
             redshifts.clone(),
@@ -168,7 +193,17 @@ fn main() -> PolarsResult<()> {
             redshift_bins.clone(),
             n_clone,
         );
-        let delta_func = |z| interp(&x_values, &y_values, z, &InterpMode::default());
+        let delta_func = |z| interp(&x_values, &y_values, z, &InterpMode::Constant(1.));
+        // testing
+        let x = arange(0.01, 1., 0.01);
+        let y: Vec<f64> = x.iter().map(|&r| delta_func(r)).collect();
+        let file = File::create("delete.csv")?;
+        let mut wtr = Writer::from_writer(file);
+        for (_x, _y) in x.iter().zip(y.iter()) {
+            wtr.write_record(&[_x.to_string(), _y.to_string()]).unwrap();
+        }
+        wtr.flush().unwrap();
+        //
         let v_dc_maxes: Vec<f64> = max_zs
             .iter()
             .map(|&z| calculate_v_dc_max(z, delta_func, &cosmo))

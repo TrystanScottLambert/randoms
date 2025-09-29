@@ -6,8 +6,10 @@ use integrate::adaptive_quadrature;
 use libm::log10;
 use rand_distr::{Distribution, Normal};
 use std::f64::consts::PI;
+use polars::prelude::*;
 
 use crate::cosmology::Cosmology;
+use crate::histogram::{arange, calculate_fd, histogram};
 
 /// calcuates the redshift at which the current galaxy with magntidue mag and redshift z would be
 /// visible
@@ -74,19 +76,76 @@ fn populate_volume(z: f64, z_max: f64, n_points: i32, cosmo: Cosmology) -> Vec<f
         .collect::<Vec<f64>>()
 }
 
-fn approximate_delta(
+fn approximate_delta_y(
     real_redshifts: Vec<f64>,
     random_redshifts: Vec<f64>,
     redshift_bins: Vec<f64>,
-    n_clone: i32,
-) {
-    let center_redshift_bins: Vec<f64> = redshift_bins
-        .windows(2)
-        .map(|b| (b[0] + b[1]) / 2.)
-        .collect();
-
+    n_clone: f64,
+) -> Vec<f64> {
+    let n_g = histogram(real_redshifts, redshift_bins.clone());
+    let n_r = histogram(random_redshifts, redshift_bins.clone());
+    let n_r = n_r
+        .iter()
+        .map(|&c| if c == 0 { 1 } else { c })
+        .collect::<Vec<i32>>();
+    n_g.iter()
+        .zip(n_r)
+        .map(|(&g, r)| n_clone * (g as f64 / r as f64))
+        .collect::<Vec<f64>>()
 }
 
-fn main() {
-    println!("Hello, world!");
+fn approximate_delta_x(redshift_bins: Vec<f64>) -> Vec<f64> {
+    redshift_bins
+        .windows(2)
+        .map(|b| (b[0] + b[1]) / 2.)
+        .collect()
+}
+
+fn read_gama<P: AsRef<Path>>(file_path: P) -> PolarsResult<DataFrame> {
+    CsvReader::from_path(file_path)?
+        .with_delimiter(b' ')
+        .has_header(true)
+        .finish()
+}
+
+fn main() -> PolarsResult<()> {
+    let maglim = 19.8;
+    let n_clone = 400.;
+    let file_name = "/Users/00115372/Desktop/prototype_nz/g09_galaxies.dat";
+    let cosmo = Cosmology {
+            omega_m: 0.3,
+            omega_k: 0.,
+            omega_l: 0.7,
+            h0: 70.,
+        };
+    
+    //read in file
+    let df = read_gama(file_name)?;
+    let redshifts = df.column("z")?
+        .f64()?
+        .into_no_null_iter()
+        .collect::<Vec<f64>>();
+
+    let mags = df.column("Rpetro")?
+        .f64()?
+        .into_no_null_iter()
+        .collect::<Vec<f64>>();
+    
+    let bin_width = calculate_fd(redshifts);
+    let max_z = 1.; //TODO: How do we fix this thing.
+
+    let max_zs = redshifts
+        .iter()
+        .zip(mags)
+        .map(|(&z, m)| calculate_max_z(mag, z, maglim, cosmo))
+        .collect::<Vec<f64>>();
+
+    let first_randoms = redshifts
+        .iter()
+        .zip(max_zs)
+        .map(|(&z, max_z)| populate_volume(z, max_z, n_points, cosmo))
+        .collect::<Vec<Vec<f64>>>();
+
+    
+
 }

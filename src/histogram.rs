@@ -1,7 +1,7 @@
 use statrs::statistics::Data;
 use statrs::statistics::OrderStatistics;
 
-fn arange(start: f64, end: f64, step: f64) -> Vec<f64> {
+pub fn arange(start: f64, end: f64, step: f64) -> Vec<f64> {
     let mut range = Vec::new();
     let mut location = start;
 
@@ -12,7 +12,7 @@ fn arange(start: f64, end: f64, step: f64) -> Vec<f64> {
     range
 }
 
-pub fn histogram(data: Vec<f64>, bins: Vec<f64>) -> Vec<usize> {
+pub fn histogram(data: Vec<f64>, bins: Vec<f64>) -> Vec<i32> {
     let mut counts = vec![0; bins.len() - 1];
 
     for x in data {
@@ -29,7 +29,7 @@ pub fn histogram(data: Vec<f64>, bins: Vec<f64>) -> Vec<usize> {
 }
 
 /// Calculates the Freedman–Diaconis_rule for binwidth.
-fn calculate_fd(data: Vec<f64>) -> f64 {
+pub fn calculate_fd(data: Vec<f64>) -> f64 {
     let mut x = Data::new(data.clone());
     let iqr = x.upper_quartile() - x.lower_quartile();
     let n = data.clone().len() as f64;

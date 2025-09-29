@@ -37,7 +37,7 @@ pub fn calculate_fd(data: Vec<f64>) -> f64 {
 }
 
 /// Histogram that automatically selects the "optimal" bins using the Freedman-Diaconis rule
-pub fn histogram_fd(data: Vec<f64>, end: f64) -> Vec<usize> {
+pub fn histogram_fd(data: Vec<f64>, end: f64) -> Vec<i32> {
     let bin_width = calculate_fd(data.clone());
     let bins = arange(0., end, bin_width);
     histogram(data, bins)
@@ -56,7 +56,7 @@ mod tests {
         let result = histogram(data, bins);
         let answer = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1];
         for (r, a) in zip(result, answer) {
-            assert_eq!(r, a as usize);
+            assert_eq!(r, a);
         }
     }
 

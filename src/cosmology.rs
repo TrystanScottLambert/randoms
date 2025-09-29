@@ -15,10 +15,7 @@ fn inverse(root_function: impl Fn(f64) -> f64) -> f64 {
         eps: 1e-8f64,
         max_iter: 30,
     };
-    match find_root_brent(1e-9, 1200., &root_function, &mut convergency) {
-        Ok(t) => t,
-        Err(_error) => 0.0,
-    }
+    find_root_brent(1e-9, 1200., &root_function, &mut convergency).unwrap_or(0.)
 }
 
 /// A Flat lambda CDM cosmology object.
@@ -441,7 +438,7 @@ mod tests {
 
     #[test]
     fn testing_inverse_luminosity_distance() {
-                let cosmo = Cosmology {
+        let cosmo = Cosmology {
             omega_m: 0.3,
             omega_k: 0.,
             omega_l: 0.7,
@@ -452,10 +449,13 @@ mod tests {
             .iter()
             .map(|&z| cosmo.luminosity_distance(z))
             .collect::<Vec<f64>>();
-        
-        let results: Vec<f64> = calced_distanced.iter().map(|&d| cosmo.inverse_lumdist(d)).collect();
+
+        let results: Vec<f64> = calced_distanced
+            .iter()
+            .map(|&d| cosmo.inverse_lumdist(d))
+            .collect();
         for (r, a) in zip(results, redshifts) {
-            assert!((r-a).abs() < 1e-5)
+            assert!((r - a).abs() < 1e-5)
         }
-    }   
+    }
 }

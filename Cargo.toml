@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 integrate = "0.1.11"
+interp = "2.1.1"
 libm = "0.2.15"
 ndhistogram = "0.10.0"
 polars = "0.51.0"

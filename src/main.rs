@@ -3,10 +3,11 @@ pub mod cosmology;
 pub mod histogram;
 
 use integrate::adaptive_quadrature;
+use interp::{InterpMode, interp, interp_array, interp_slice};
 use libm::log10;
+use polars::prelude::*;
 use rand_distr::{Distribution, Normal};
 use std::f64::consts::PI;
-use polars::prelude::*;
 
 use crate::cosmology::Cosmology;
 use crate::histogram::{arange, calculate_fd, histogram};
@@ -20,11 +21,7 @@ fn calculate_max_z(mag: f64, z: f64, mag_lim: f64, cosmo: Cosmology) -> f64 {
 }
 
 /// Calculates the density corrected volume based on the given overdensity function delta_z
-fn calculate_v_dc_max<F: Fn(f64) -> f64 + Sync + Copy>(
-    z_max: f64,
-    delta_z: F,
-    cosmo: Cosmology,
-) -> f64 {
+fn calculate_v_dc_max<F: Fn(f64) -> f64 + Sync>(z_max: f64, delta_z: F, cosmo: Cosmology) -> f64 {
     let integrand = |z: f64| delta_z(z) * cosmo.differential_comoving_distance(z);
     let tolerance = 1e-5;
     let min_h = 1e-7;
@@ -46,7 +43,7 @@ fn reflect_into_range(value: f64, min_value: f64, max_value: f64) -> f64 {
 }
 
 /// Create randoms values within
-fn populate_volume(z: f64, z_max: f64, n_points: i32, cosmo: Cosmology) -> Vec<f64> {
+fn populate_volume(z: f64, z_max: f64, n_points: f64, cosmo: Cosmology) -> Vec<f64> {
     let mut random_volumes = Vec::new();
     let volume = cosmo.comoving_volume(z);
     let max_volume = cosmo.comoving_volume(z_max);
@@ -101,6 +98,17 @@ fn approximate_delta_x(redshift_bins: Vec<f64>) -> Vec<f64> {
         .collect()
 }
 
+fn appproximate_delta(
+    real_redshifts: Vec<f64>,
+    random_redshifts: Vec<f64>,
+    redshift_bins: Vec<f64>,
+    n_clone: f64,
+) -> impl Fn(f64) -> f64 + Sync {
+    x_values = approximate_delta_x(redshift_bins);
+    y_values = approximate_delta_y(real_redshifts, random_redshifts, redshift_bins, n_clone);
+    move |z| interp(&x_values, &y_values, z, InterpMode::Extrapolate());
+}
+
 fn read_gama<P: AsRef<Path>>(file_path: P) -> PolarsResult<DataFrame> {
     CsvReader::from_path(file_path)?
         .with_delimiter(b' ')
@@ -113,26 +121,30 @@ fn main() -> PolarsResult<()> {
     let n_clone = 400.;
     let file_name = "/Users/00115372/Desktop/prototype_nz/g09_galaxies.dat";
     let cosmo = Cosmology {
-            omega_m: 0.3,
-            omega_k: 0.,
-            omega_l: 0.7,
-            h0: 70.,
-        };
-    
+        omega_m: 0.3,
+        omega_k: 0.,
+        omega_l: 0.7,
+        h0: 70.,
+    };
+
     //read in file
     let df = read_gama(file_name)?;
-    let redshifts = df.column("z")?
+    let redshifts = df
+        .column("z")?
         .f64()?
         .into_no_null_iter()
         .collect::<Vec<f64>>();
 
-    let mags = df.column("Rpetro")?
+    let mags = df
+        .column("Rpetro")?
         .f64()?
         .into_no_null_iter()
         .collect::<Vec<f64>>();
-    
+
     let bin_width = calculate_fd(redshifts);
+
     let max_z = 1.; //TODO: How do we fix this thing.
+    let redshift_bins = arange(0., max_z, bin_width);
 
     let max_zs = redshifts
         .iter()
@@ -146,6 +158,34 @@ fn main() -> PolarsResult<()> {
         .map(|(&z, max_z)| populate_volume(z, max_z, n_points, cosmo))
         .collect::<Vec<Vec<f64>>>();
 
-    
+    let v_maxes = max_zs
+        .iter()
+        .map(|&z| cosmo.comoving_volume(z))
+        .collect::<Vec<f64>>();
 
+    let delta_func = appproximate_delta(redshifts, first_randoms, redshift_bins, n_clone);
+    let n_new = vec![400.; redshifts.len()];
+    let n_old = vec![1.; redshifts.len()];
+    while n_new != n_old {
+        n_old = n_new;
+        let v_dc_maxes = max_zs
+            .iter()
+            .map(|&z| calculate_v_dc_max(z, delta_func, cosmo))
+            .collect();
+        let n_new: Vec<f64> = v_maxes
+            .iter()
+            .zip(v_dc_maxes)
+            .map(|(&v, v_dc)| n_clone * v / v_dc)
+            .collect();
+        let next_randoms = redshifts
+            .iter()
+            .zip(max_zs)
+            .zip(n_new)
+            .map(|((&z, z_max), n)| populate_volume(z, z_max, n, cosmo))
+            .collect();
+        let new_ratio = next_randoms.len() / redshifts.len();
+        let delta_func =
+            appproximate_delta(redshifts, next_randoms, redshift_bins, new_ratio as f64);
+        println!("{new_ratio}")
+    }
 }

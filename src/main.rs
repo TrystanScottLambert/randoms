@@ -20,18 +20,15 @@ use crate::histogram::{arange, calculate_fd, histogram};
 fn calculate_max_z(mag: f64, z: f64, mag_lim: f64, cosmo: &Cosmology) -> f64 {
     let distance_measured = cosmo.luminosity_distance(z) * 1e6; // Mpc to pc
     let max_distance = 10_f64.powf((mag_lim - mag + 5. * log10(distance_measured)) / 5.);
-    cosmo.inverse_lumdist(max_distance/1e6) // back to Mpc
+    cosmo.inverse_lumdist(max_distance / 1e6) // back to Mpc
 }
 
 fn fast_rough_integral<F: Fn(f64) -> f64 + Sync>(function: F, limit: f64) -> f64 {
     let bin_size = 0.0001;
-    println!("Getting Here");
     let xs = arange(0., limit, bin_size);
-    println!("Done Here");
     let ys: Vec<f64> = xs.iter().map(|&b| function(b)).collect();
     ys.into_iter().sum::<f64>() * bin_size
 }
-
 
 /// Calculates the density corrected volume based on the given overdensity function delta_z
 fn calculate_v_dc_max<F: Fn(f64) -> f64 + Sync>(z_max: f64, delta_z: F, cosmo: &Cosmology) -> f64 {
@@ -84,7 +81,7 @@ fn populate_volume(z: f64, z_max: f64, n_points: f64, cosmo: &Cosmology) -> Vec<
 
     let normal = Normal::new(volume, sigma_vol).unwrap();
     let mut counter = 0.;
-    
+
     while counter < n_points {
         let v = normal.sample(&mut rand::rng());
         if (v < max_vol) && (v > min_vol) {

@@ -37,9 +37,8 @@ fn calculate_v_dc_max<F: Fn(f64) -> f64 + Sync>(z_max: f64, delta_z: F, cosmo: &
     v_dc * 4. * PI
 }
 
-#[warn(dead_code)]
 /// Reflect the value if it is outside of the min values back within the bounds.
-fn reflect_into_range(value: f64, min_value: f64, max_value: f64) -> f64 {
+fn _reflect_into_range(value: f64, min_value: f64, max_value: f64) -> f64 {
     if value < min_value {
         2. * min_value - value
     } else if value > max_value {
@@ -140,9 +139,72 @@ fn read_gama<P: AsRef<Path>>(file_path: P) -> PolarsResult<DataFrame> {
     Ok(df)
 }
 
+fn generate_randoms(
+    redshifts: Vec<f64>,
+    mags: Vec<f64>,
+    max_z: f64,
+    maglim: f64,
+    n_clone: i32,
+    iterations: i32,
+    cosmo: Cosmology,
+) -> Vec<f64> {
+    let bin_width = calculate_fd(redshifts.clone());
+    let redshift_bins = arange(0., max_z, bin_width);
+    let max_zs = redshifts
+        .clone()
+        .iter()
+        .zip(mags)
+        .map(|(&z, m)| calculate_max_z(m, z, maglim, &cosmo))
+        .collect::<Vec<f64>>();
+
+    let mut randoms: Vec<f64> = redshifts
+        .par_iter()
+        .zip(max_zs.clone())
+        .flat_map(|(&z, max_z)| populate_volume(z, max_z, n_clone as f64, &cosmo))
+        .collect();
+
+    let v_maxes = max_zs
+        .clone()
+        .iter()
+        .map(|&z| cosmo.comoving_volume(z))
+        .collect::<Vec<f64>>();
+
+    for _ in 0..iterations {
+        let x_values = approximate_delta_x(redshift_bins.clone());
+        let y_values = approximate_delta_y(
+            redshifts.clone(),
+            randoms.clone(),
+            redshift_bins.clone(),
+            n_clone as f64,
+        );
+        let delta_func = |z| interp(&x_values, &y_values, z, &InterpMode::Constant(1.));
+        let v_dc_maxes: Vec<f64> = max_zs
+            .par_iter()
+            .map(|&z| calculate_v_dc_max(z, delta_func, &cosmo))
+            .collect();
+        let n_new: Vec<f64> = v_maxes
+            .iter()
+            .zip(v_dc_maxes)
+            .map(|(&v, v_dc)| n_clone as f64 * v / v_dc)
+            .collect();
+
+        randoms = redshifts
+            .clone()
+            .par_iter()
+            .zip(max_zs.clone())
+            .zip(n_new)
+            .flat_map(|((&z, z_max), n)| populate_volume(z, z_max, n, &cosmo))
+            .collect();
+    }
+
+    randoms
+}
 fn main() -> PolarsResult<()> {
     let maglim = 19.8;
-    let n_clone = 400.;
+    let n_clone = 400;
+    let iterations = 10;
+    let max_z = 1.;
+
     let file_name = "/Users/00115372/Desktop/prototype_nz/g09_galaxies.dat";
     let cosmo = Cosmology {
         omega_m: 0.3,
@@ -164,60 +226,14 @@ fn main() -> PolarsResult<()> {
         .f64()?
         .into_no_null_iter()
         .collect::<Vec<f64>>();
-    let bin_width = calculate_fd(redshifts.clone());
 
-    let max_z = 1.; //TODO: How do we fix this thing.
-    let redshift_bins = arange(0., max_z, bin_width);
-    let max_zs = redshifts
-        .clone()
-        .iter()
-        .zip(mags)
-        .map(|(&z, m)| calculate_max_z(m, z, maglim, &cosmo))
-        .collect::<Vec<f64>>();
-    let randoms: Vec<f64> = redshifts
-        .par_iter()
-        .zip(max_zs.clone())
-        .flat_map(|(&z, max_z)| populate_volume(z, max_z, n_clone, &cosmo))
-        .collect();
-    let v_maxes = max_zs
-        .clone()
-        .iter()
-        .map(|&z| cosmo.comoving_volume(z))
-        .collect::<Vec<f64>>();
-    let mut counter = 1;
-    while counter < 10 {
-        let x_values = approximate_delta_x(redshift_bins.clone());
-        let y_values = approximate_delta_y(
-            redshifts.clone(),
-            randoms.clone(),
-            redshift_bins.clone(),
-            n_clone,
-        );
-        let delta_func = |z| interp(&x_values, &y_values, z, &InterpMode::Constant(1.));
-        let v_dc_maxes: Vec<f64> = max_zs
-            .par_iter()
-            .map(|&z| calculate_v_dc_max(z, delta_func, &cosmo))
-            .collect();
-        let n_new: Vec<f64> = v_maxes
-            .iter()
-            .zip(v_dc_maxes)
-            .map(|(&v, v_dc)| n_clone * v / v_dc)
-            .collect();
-        let randoms: Vec<f64> = redshifts
-            .clone()
-            .par_iter()
-            .zip(max_zs.clone())
-            .zip(n_new)
-            .flat_map(|((&z, z_max), n)| populate_volume(z, z_max, n, &cosmo))
-            .collect();
-        counter += 1;
+    let randoms = generate_randoms(redshifts, mags, max_z, maglim, n_clone, iterations, cosmo);
 
-        // writing the randoms
-        let file = File::create("delete_randoms.csv").unwrap();
-        let mut wtr = Writer::from_writer(file);
-        for x in randoms.iter() {
-            wtr.write_record(&[x.to_string()]).unwrap()
-        }
+    // writing the randoms
+    let file = File::create("delete_randoms.csv").unwrap();
+    let mut wtr = Writer::from_writer(file);
+    for x in randoms.iter() {
+        wtr.write_record(&[x.to_string()]).unwrap()
     }
     Ok(())
 }

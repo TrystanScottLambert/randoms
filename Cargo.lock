@@ -2282,6 +2282,7 @@ dependencies = [
  "polars",
  "rand 0.9.2",
  "rand_distr 0.5.1",
+ "rayon",
  "roots",
  "rtnorm-rust",
  "statrs",

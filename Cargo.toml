@@ -2,6 +2,8 @@
 name = "randoms"
 version = "0.1.0"
 edition = "2024"
+description = "Generating randoms catalogue for redshift surveys."
+license = "MIT"
 
 [lib]
 name = "randoms"

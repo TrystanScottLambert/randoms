@@ -1,5 +1,5 @@
 //! #randoms
-//! 
+//!
 //! randoms is a crate to generate random catalogues of galaxies from redshift surveys in order
 //! to better model the selction function of these surveys and remove the underlying large-scale
 //! structure. This is essential for things like studying clustering and modelling the n(z) for
@@ -19,7 +19,7 @@ use crate::cosmology::Cosmology;
 use crate::histogram::{arange, calculate_fd, histogram, linspace};
 
 /// Calcuates the redshift at which the current galaxy with magntidue mag and redshift z would be visible.
-/// 
+///
 /// Calculates the luminosity distance at the given redshift, z and then uses the distance modulus
 /// to solve for the distance at the mag_lim. The inverse luminosity distance is then used to calculate
 /// the max distance.
@@ -30,7 +30,7 @@ fn calculate_max_z(mag: f64, z: f64, mag_lim: f64, cosmo: &Cosmology) -> f64 {
 }
 
 /// A rough rieman sum numerical approximation for fast but less accurate numerical integration.
-/// 
+///
 /// This creates an x grid consiting of 1000 points, equally spaced from 0, to the limit of
 /// integration and then evaluates the function at these points. The Rieman sum is then performed
 /// to calcualte the intergal.
@@ -42,7 +42,7 @@ fn fast_rough_integral<F: Fn(f64) -> f64 + Sync>(function: F, limit: f64) -> f64
 }
 
 /// Calculates the density corrected volume based on the given overdensity function delta_z
-/// 
+///
 /// Evaluates the the product of the over density function (delta_z) and the differential comovoing
 /// distance to get the density-weighted maximum comoving volume (Eq. 5 Farrow+2015).
 fn calculate_v_dc_max<F: Fn(f64) -> f64 + Sync>(z_max: f64, delta_z: F, cosmo: &Cosmology) -> f64 {
@@ -87,7 +87,7 @@ fn inverse_interp_binary(y_vals: &[f64], x_vals: &[f64], target_y: f64) -> f64 {
 }
 
 /// Create randoms redshift values, popuated within the volume.
-/// 
+///
 /// Randomly generates volumes from a normal distribution with a mean of the comoving volume defined
 /// at z and a static sigma of 3.5e9. Volumes less than 0 and more than the max volume defined by
 /// z_max are ignored.
@@ -124,7 +124,7 @@ fn populate_volume(z: f64, z_max: f64, n_points: f64, z_limit: f64, cosmo: &Cosm
 }
 
 /// Helper function to calculate the y values of the overdensity function.
-/// 
+///
 /// Histograms the real and randoms data and returns the ratio of the two multiplied by the given
 /// n_clone.
 fn approximate_delta_y(
@@ -145,8 +145,8 @@ fn approximate_delta_y(
         .collect::<Vec<f64>>()
 }
 
-/// Helper function that determine the x values of the approximate delta z function. 
-/// 
+/// Helper function that determine the x values of the approximate delta z function.
+///
 /// Calcualtes the midpoints of the redshift bins.
 fn approximate_delta_x(redshift_bins: Vec<f64>) -> Vec<f64> {
     redshift_bins
@@ -156,15 +156,15 @@ fn approximate_delta_x(redshift_bins: Vec<f64>) -> Vec<f64> {
 }
 
 /// Main function which generates the randoms vector of the survey.
-/// 
+///
 /// @param redshifts The redshifts of the survey.
 /// @param mags The apparent magnitudes of the galaxies in the survey.
 /// @param z_lim The redshift up to which the user wishes to evaluate. This can just be a reasonble choice greater than the max redshift.
 /// @param maglim The magnitude limit of the survey.
 /// @param n_clone The number of times more the randoms catalogue will be than the original catalogue.
 /// @param iterations The number of iterations to iteratively solve for delta_z (usually 5-10 is plenty).
-/// @param cosmo The Cosmology object from the Cosmology module. 
-/// 
+/// @param cosmo The Cosmology object from the Cosmology module.
+///
 /// This function iteratively solves for the overdensity function by first cloning all galxies
 /// n_clone number of times, and calcualte the delta_z function using that randoms catalogue.
 /// See section 3.1.1 of Farrow+2015 for more details.
@@ -259,7 +259,6 @@ mod tests {
         let tolerance = 1e-3; // since it’s a rough method
         assert!((result - expected).abs() < tolerance);
     }
-
 
     #[test]
     fn test_inverse_interp_binary_exact_match() {

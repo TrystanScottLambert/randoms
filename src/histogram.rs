@@ -114,7 +114,7 @@ mod tests {
         ];
 
         for (r, a) in zip(result, answer) {
-            assert!((r-a).abs() < 1e-5)
+            assert!((r - a).abs() < 1e-5)
         }
     }
 

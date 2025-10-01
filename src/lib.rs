@@ -1,4 +1,4 @@
-//! #randoms
+//! # randoms
 //!
 //! randoms is a crate to generate random catalogues of galaxies from redshift surveys in order
 //! to better model the selction function of these surveys and remove the underlying large-scale
@@ -156,14 +156,16 @@ fn approximate_delta_x(redshift_bins: Vec<f64>) -> Vec<f64> {
 }
 
 /// Main function which generates the randoms vector of the survey.
-///
-/// @param redshifts The redshifts of the survey.
-/// @param mags The apparent magnitudes of the galaxies in the survey.
-/// @param z_lim The redshift up to which the user wishes to evaluate. This can just be a reasonble choice greater than the max redshift.
-/// @param maglim The magnitude limit of the survey.
-/// @param n_clone The number of times more the randoms catalogue will be than the original catalogue.
-/// @param iterations The number of iterations to iteratively solve for delta_z (usually 5-10 is plenty).
-/// @param cosmo The Cosmology object from the Cosmology module.
+/// 
+/// # Arguments
+/// 
+/// * `redshifts` The redshifts of the survey.
+/// * `mags` The apparent magnitudes of the galaxies in the survey.
+/// * `z_lim` The redshift up to which the user wishes to evaluate. This can just be a reasonble choice greater than the max redshift.
+/// * `maglim` The magnitude limit of the survey.
+/// * `n_clone` The number of times more the randoms catalogue will be than the original catalogue.
+/// * `iterations` The number of iterations to iteratively solve for delta_z (usually 5-10 is plenty).
+/// * `cosmo` The Cosmology object from the Cosmology module.
 ///
 /// This function iteratively solves for the overdensity function by first cloning all galxies
 /// n_clone number of times, and calcualte the delta_z function using that randoms catalogue.

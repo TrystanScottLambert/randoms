@@ -2,18 +2,14 @@ pub mod constants;
 pub mod cosmology;
 pub mod histogram;
 
-use csv::Writer;
 use interp::{InterpMode, interp};
 use libm::log10;
-use polars::prelude::*;
 use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
 use std::f64::consts::PI;
-use std::fs::File;
-use std::path::Path;
 
 use crate::cosmology::Cosmology;
-use crate::histogram::{arange, calculate_fd, histogram};
+use crate::histogram::{arange, calculate_fd, histogram, linspace};
 
 /// calcuates the redshift at which the current galaxy with magntidue mag and redshift z would be
 /// visible
@@ -24,8 +20,8 @@ fn calculate_max_z(mag: f64, z: f64, mag_lim: f64, cosmo: &Cosmology) -> f64 {
 }
 
 fn fast_rough_integral<F: Fn(f64) -> f64 + Sync>(function: F, limit: f64) -> f64 {
-    let bin_size = 0.01;
-    let xs = arange(0., limit, bin_size);
+    let xs = linspace(0., limit, 1000);
+    let bin_size = xs[1] - xs[0];
     let ys: Vec<f64> = xs.iter().map(|&b| function(b)).collect();
     ys.into_iter().sum::<f64>() * bin_size
 }
@@ -72,7 +68,7 @@ fn inverse_interp_binary(y_vals: &[f64], x_vals: &[f64], target_y: f64) -> f64 {
 }
 
 /// Create randoms values within
-fn populate_volume(z: f64, z_max: f64, n_points: f64, cosmo: &Cosmology) -> Vec<f64> {
+fn populate_volume(z: f64, z_max: f64, n_points: f64, z_limit: f64, cosmo: &Cosmology) -> Vec<f64> {
     let mut random_volumes = Vec::new();
     let volume = cosmo.comoving_volume(z);
     let max_volume = cosmo.comoving_volume(z_max);
@@ -95,7 +91,7 @@ fn populate_volume(z: f64, z_max: f64, n_points: f64, cosmo: &Cosmology) -> Vec<
         }
     }
 
-    let z_vals = arange(0., 1., 0.001);
+    let z_vals = linspace(0., z_limit, 1000);
     let covol: Vec<f64> = z_vals.iter().map(|&z| cosmo.comoving_volume(z)).collect();
 
     random_volumes
@@ -129,27 +125,17 @@ fn approximate_delta_x(redshift_bins: Vec<f64>) -> Vec<f64> {
         .collect()
 }
 
-fn read_gama<P: AsRef<Path>>(file_path: P) -> PolarsResult<DataFrame> {
-    let file = File::open(file_path)?;
-    let parse_opts = CsvParseOptions::default().with_separator(b' ');
-    let options = CsvReadOptions::default()
-        .with_parse_options(parse_opts)
-        .with_has_header(true);
-    let df = CsvReader::new(file).with_options(options).finish()?;
-    Ok(df)
-}
-
-fn generate_randoms(
+pub fn generate_randoms(
     redshifts: Vec<f64>,
     mags: Vec<f64>,
-    max_z: f64,
+    z_lim: f64,
     maglim: f64,
     n_clone: i32,
     iterations: i32,
     cosmo: Cosmology,
 ) -> Vec<f64> {
     let bin_width = calculate_fd(redshifts.clone());
-    let redshift_bins = arange(0., max_z, bin_width);
+    let redshift_bins = arange(0., z_lim, bin_width);
     let max_zs = redshifts
         .clone()
         .iter()
@@ -160,7 +146,7 @@ fn generate_randoms(
     let mut randoms: Vec<f64> = redshifts
         .par_iter()
         .zip(max_zs.clone())
-        .flat_map(|(&z, max_z)| populate_volume(z, max_z, n_clone as f64, &cosmo))
+        .flat_map(|(&z, max_z)| populate_volume(z, max_z, n_clone as f64, z_lim, &cosmo))
         .collect();
 
     let v_maxes = max_zs
@@ -193,47 +179,9 @@ fn generate_randoms(
             .par_iter()
             .zip(max_zs.clone())
             .zip(n_new)
-            .flat_map(|((&z, z_max), n)| populate_volume(z, z_max, n, &cosmo))
+            .flat_map(|((&z, z_max), n)| populate_volume(z, z_max, n, z_lim, &cosmo))
             .collect();
     }
 
     randoms
-}
-fn main() -> PolarsResult<()> {
-    let maglim = 19.8;
-    let n_clone = 400;
-    let iterations = 10;
-    let max_z = 1.;
-
-    let file_name = "/Users/00115372/Desktop/prototype_nz/g09_galaxies.dat";
-    let cosmo = Cosmology {
-        omega_m: 0.3,
-        omega_k: 0.,
-        omega_l: 0.7,
-        h0: 70.,
-    };
-
-    //read in file
-    let df = read_gama(file_name)?;
-    let redshifts = df
-        .column("Z")?
-        .f64()?
-        .into_no_null_iter()
-        .collect::<Vec<f64>>();
-
-    let mags = df
-        .column("Rpetro")?
-        .f64()?
-        .into_no_null_iter()
-        .collect::<Vec<f64>>();
-
-    let randoms = generate_randoms(redshifts, mags, max_z, maglim, n_clone, iterations, cosmo);
-
-    // writing the randoms
-    let file = File::create("delete_randoms.csv").unwrap();
-    let mut wtr = Writer::from_writer(file);
-    for x in randoms.iter() {
-        wtr.write_record(&[x.to_string()]).unwrap()
-    }
-    Ok(())
 }

@@ -1,6 +1,7 @@
 use statrs::statistics::Data;
 use statrs::statistics::OrderStatistics;
 
+/// Function to replicate the np.arange functionality
 pub fn arange(start: f64, end: f64, step: f64) -> Vec<f64> {
     let mut range = Vec::new();
     let mut location = start;
@@ -10,6 +11,16 @@ pub fn arange(start: f64, end: f64, step: f64) -> Vec<f64> {
         location += step;
     }
     range
+}
+
+/// Function to replicate the np.linspace functionality
+pub fn linspace(start: f64, end: f64, number_separations: usize) -> Vec<f64> {
+    assert!(number_separations >= 2, "number_separations must be >= 2");
+
+    let step = (end - start) / (number_separations as f64 - 1.0);
+    (0..number_separations)
+        .map(|i| start + step * i as f64)
+        .collect()
 }
 
 pub fn histogram(data: Vec<f64>, bins: Vec<f64>) -> Vec<i32> {
@@ -28,7 +39,7 @@ pub fn histogram(data: Vec<f64>, bins: Vec<f64>) -> Vec<i32> {
     counts
 }
 
-/// Calculates the Freedman–Diaconis_rule for binwidth.
+/// Calculates the Freedman–Diaconis rule for binwidth.
 pub fn calculate_fd(data: Vec<f64>) -> f64 {
     let mut x = Data::new(data.clone());
     let iqr = x.upper_quartile() - x.lower_quartile();
@@ -73,6 +84,37 @@ mod tests {
         let answer = [0., 0.1, 0.2, 0.3, 0.4];
         for (r, a) in zip(result, answer) {
             assert!((r - a).abs() < 1e-7)
+        }
+    }
+
+    #[test]
+    fn test_linspace() {
+        let result = linspace(0., 100., 20);
+        let answer = [
+            0.,
+            5.26315789,
+            10.52631579,
+            15.78947368,
+            21.05263158,
+            26.31578947,
+            31.57894737,
+            36.84210526,
+            42.10526316,
+            47.36842105,
+            52.63157895,
+            57.89473684,
+            63.15789474,
+            68.42105263,
+            73.68421053,
+            78.94736842,
+            84.21052632,
+            89.47368421,
+            94.73684211,
+            100.,
+        ];
+
+        for (r, a) in zip(result, answer) {
+            assert!((r-a).abs() < 1e-5)
         }
     }
 

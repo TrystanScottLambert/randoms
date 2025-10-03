@@ -25,3 +25,8 @@ target
 
 /target
 *.csv
+.DS_Store/*
+.DS_Store/
+.DS_Store
+Cargo.lock
+*.svg

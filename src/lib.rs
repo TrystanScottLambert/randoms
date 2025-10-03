@@ -14,7 +14,6 @@ use libm::log10;
 use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
 use std::f64::consts::PI;
-use std::time::Instant;
 
 use crate::cosmology::Cosmology;
 use crate::histogram::{arange, calculate_fd, histogram, linspace};
@@ -268,7 +267,6 @@ pub fn generate_randoms(
     iterations: i32,
     cosmo: Cosmology,
 ) -> Vec<f64> {
-    let now_maxzs = Instant::now();
     let bin_width = calculate_fd(redshifts.clone());
     let redshift_bins = arange(0., z_lim, bin_width);
     let max_zs = redshifts
@@ -277,7 +275,6 @@ pub fn generate_randoms(
         .zip(mags)
         .map(|(&z, m)| calculate_max_z(m, z, maglim, &cosmo))
         .collect::<Vec<f64>>();
-    println!("max_z time: {:?}", now_maxzs.elapsed());
 
     // PRE-COMPUTE comoving volume lookup table ONCE
     let z_vals = linspace(0., z_lim, 1000);
@@ -285,7 +282,6 @@ pub fn generate_randoms(
         .map(|&z| cosmo.comoving_volume(z))
         .collect();
 
-    let now_init_randoms = Instant::now();
     let mut randoms: Vec<f64> = redshifts
         .par_iter()
         .zip(max_zs.clone())
@@ -293,15 +289,11 @@ pub fn generate_randoms(
             populate_volume(z, max_z, n_clone as f64, &z_vals, &covol)
         })
         .collect();
-    println!(" initital randoms: {:?}", now_init_randoms.elapsed());
 
-    let now_init_vmaxes = Instant::now();
     // Use the lookup table here too
     let v_maxes: Vec<f64> = interp_many(&z_vals, &covol, &max_zs);
-    println!("initital vmaxes: {:?}", now_init_vmaxes.elapsed());
 
     for _ in 0..iterations {
-        let now_delta_z = Instant::now();
         let x_values = approximate_delta_x(redshift_bins.clone());
         let y_values = approximate_delta_y(
             redshifts.clone(),
@@ -310,21 +302,15 @@ pub fn generate_randoms(
             n_clone as f64,
         );
         let delta_func = |z| interp(&x_values, &y_values, z, &InterpMode::Constant(1.));
-        println!("building the n(z) distribution: {:?}", now_delta_z.elapsed());
         
-        let now_vdc = Instant::now();
         let v_dc_maxes = calculate_v_dc_max_batch(&max_zs, delta_func, &cosmo);
-        println!("vdc calculations: {:?}", now_vdc.elapsed());
 
-        let now_n_new = Instant::now();
         let n_new: Vec<f64> = v_maxes
             .iter()
             .zip(v_dc_maxes)
             .map(|(&v, v_dc)| n_clone as f64 * v / v_dc)
             .collect();
-        println!("Setting up n_new: {:?}", now_n_new.elapsed());
 
-        let now_randoms = Instant::now();
         randoms = redshifts
             .clone()
             .par_iter()
@@ -334,8 +320,6 @@ pub fn generate_randoms(
                 populate_volume(z, z_max, n, &z_vals, &covol)
             })
             .collect();
-        println!("setting up next randoms: {:?}", now_randoms.elapsed());
-        println!(" ");
     }
 
     randoms

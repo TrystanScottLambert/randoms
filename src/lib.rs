@@ -254,8 +254,7 @@ pub fn generate_randoms(
     let mut n_r = vec![0i32; redshift_bins.len() - 1];
     let mut y_values = vec![0.0; x_values.len()];
 
-    for iteration in 0..iterations {
-        println!("Iteration {}/{}", iteration + 1, iterations);
+    for _ in 0..iterations {
 
         // Compute histogram in-place (no clone!)
         n_r.fill(0);

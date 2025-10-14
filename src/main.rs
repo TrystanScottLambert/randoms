@@ -18,13 +18,13 @@ fn read_gama<P: AsRef<Path>>(file_path: P) -> PolarsResult<DataFrame> {
 }
 
 fn main() -> PolarsResult<()> {
-    let maglim = 21.2;
+    let maglim = 21.2;//17.77;//21.2;
     let n_clone = 100;
     let iterations = 10;
-    let max_z = 2.;
+    let max_z = 2.;//0.2;//2.;
 
-    //let file_name = "/Users/00115372/Desktop/prototype_nz/g09_galaxies.dat";
-    //let file_name = "/Users/00115372/Desktop/nessie_plots/test_sdss.csv";
+    // let file_name = "/Users/00115372/Desktop/prototype_nz/g09_galaxies.dat";
+    // let file_name = "/Users/00115372/Desktop/nessie_plots/test_sdss.csv";
     let file_name = "/Users/00115372/Desktop/devils_groups/test_devils.csv";
 
     let cosmo = Cosmology {
@@ -37,8 +37,8 @@ fn main() -> PolarsResult<()> {
     //read in file
     let df = read_gama(file_name)?;
     let redshifts = df
-        //.column("redshift")?
-        //.column("Z")?
+        // .column("redshift")?
+        // .column("Z")?
         .column("zBest")?
         .f64()?
         .into_no_null_iter()
@@ -46,8 +46,8 @@ fn main() -> PolarsResult<()> {
     println!("NUMBER OF SOURCES {:?}", redshifts.len());
 
     let mags = df
-        //.column("rmag")?
-        //.column("Rpetro")?
+        // .column("rmag")?
+        // .column("Rpetro")?
         .column("mag_Y")?
         .f64()?
         .into_no_null_iter()

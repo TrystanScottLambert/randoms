@@ -23,19 +23,26 @@ pub fn linspace(start: f64, end: f64, number_separations: usize) -> Vec<f64> {
         .collect()
 }
 
-pub fn histogram(data: Vec<f64>, bins: Vec<f64>) -> Vec<i32> {
-    let mut counts = vec![0; bins.len() - 1];
 
-    for x in data {
-        // find the bin index
-        if let Some(idx) = bins.windows(2).position(|w| x >= w[0] && x < w[1]) {
-            counts[idx] += 1;
-        } else if x == *bins.last().unwrap() {
-            // include right edge like NumPy does
-            counts[bins.len() - 2] += 1;
-        }
+
+pub fn histogram(data: &[f64], bins: &[f64]) -> Vec<i32> {
+    if bins.len() < 2 || data.is_empty() {
+        return vec![0; bins.len().saturating_sub(1)];
     }
 
+    let mut counts = vec![0i32; bins.len() - 1];
+    let bin_width = bins[1] - bins[0];
+    let min_val = bins[0];
+    let max_val = bins[bins.len() - 1];
+
+    for &value in data {
+        if value >= min_val && value < max_val {
+            let idx = ((value - min_val) / bin_width) as usize;
+            if idx < counts.len() {
+                counts[idx] += 1;
+            }
+        }
+    }
     counts
 }
 
@@ -51,7 +58,7 @@ pub fn calculate_fd(data: Vec<f64>) -> f64 {
 pub fn histogram_fd(data: Vec<f64>, end: f64) -> Vec<i32> {
     let bin_width = calculate_fd(data.clone());
     let bins = arange(0., end, bin_width);
-    histogram(data, bins)
+    histogram(&data, &bins)
 }
 
 #[cfg(test)]
@@ -64,7 +71,7 @@ mod tests {
         // testing against numpy histogram
         let data = arange(0., 100., 1.);
         let bins = arange(10., 20., 0.5);
-        let result = histogram(data, bins);
+        let result = histogram(&data, &bins);
         let answer = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1];
         for (r, a) in zip(result, answer) {
             assert_eq!(r, a);

@@ -195,17 +195,6 @@ fn populate_volume(
     interp_many(covol_vals, covol_z_vals, &volumes)
 }
 
-/// OPTIMIZED: Takes counts directly instead of computing histogram
-fn approximate_delta_y_from_counts(n_g: &[i32], n_r: &[i32], n_clone: f64) -> Vec<f64> {
-    n_g.iter()
-        .zip(n_r.iter())
-        .map(|(&g, &r)| {
-            let r_safe = if r == 0 { 1 } else { r };
-            n_clone * (g as f64 / r_safe as f64)
-        })
-        .collect()
-}
-
 fn approximate_delta_x(redshift_bins: &[f64]) -> Vec<f64> {
     redshift_bins
         .windows(2)
@@ -213,7 +202,7 @@ fn approximate_delta_x(redshift_bins: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// Main function which generates the randoms vector of the survey.
+/// Main function which generates the randoms vector of the survey (OPTIMIZED)
 pub fn generate_randoms(
     redshifts: Vec<f64>,
     mags: Vec<f64>,
@@ -226,11 +215,11 @@ pub fn generate_randoms(
     let bin_width = calculate_fd(redshifts.clone());
     let redshift_bins = arange(0., z_lim, bin_width);
 
-    // Pre-compute x_values once (doesn't change)
+    // Pre-compute x_values once
     let x_values = approximate_delta_x(&redshift_bins);
 
-    // Pre-compute n_g once (doesn't change)
-    let n_g = histogram(redshifts.clone(), redshift_bins.clone());
+    // Pre-compute n_g once
+    let n_g = histogram(&redshifts, &redshift_bins);
 
     let max_zs: Vec<f64> = redshifts
         .par_iter()
@@ -245,24 +234,49 @@ pub fn generate_randoms(
         .map(|&z| cosmo.comoving_volume(z))
         .collect();
 
-    let mut randoms: Vec<f64> = redshifts
-        .par_iter()
-        .zip(max_zs.par_iter())
-        .flat_map(|(&z, &max_z)| populate_volume(z, max_z, n_clone as f64, &z_vals, &covol))
-        .collect();
-
+    // PRE-COMPUTE v_maxes ONCE (doesn't change across iterations)
     let v_maxes: Vec<f64> = interp_many(&z_vals, &covol, &max_zs);
     let n_clone_f64 = n_clone as f64;
+
+    // Initialize randoms vector with capacity
+    let initial_capacity = (redshifts.len() * n_clone as usize * 3) / 2;
+    let mut randoms: Vec<f64> = Vec::with_capacity(initial_capacity);
+
+    // Initial population
+    randoms.par_extend(
+        redshifts
+            .par_iter()
+            .zip(max_zs.par_iter())
+            .flat_map(|(&z, &max_z)| populate_volume(z, max_z, n_clone_f64, &z_vals, &covol)),
+    );
+
+    // Reusable buffers
+    let mut n_r = vec![0i32; redshift_bins.len() - 1];
+    let mut y_values = vec![0.0; x_values.len()];
 
     for iteration in 0..iterations {
         println!("Iteration {}/{}", iteration + 1, iterations);
 
-        // Compute histogram of randoms (only thing that changes)
-        // OPTIMIZATION: Pass reference to avoid clone if histogram supports it
-        let n_r = histogram(randoms.clone(), redshift_bins.clone());
+        // Compute histogram in-place (no clone!)
+        n_r.fill(0);
+        let bin_width_val = redshift_bins[1] - redshift_bins[0];
+        let min_val = redshift_bins[0];
+        let max_val = redshift_bins[redshift_bins.len() - 1];
 
-        // Use pre-computed n_g and new n_r
-        let y_values = approximate_delta_y_from_counts(&n_g, &n_r, n_clone_f64);
+        for &value in &randoms {
+            if value >= min_val && value < max_val {
+                let idx = ((value - min_val) / bin_width_val) as usize;
+                if idx < n_r.len() {
+                    n_r[idx] += 1;
+                }
+            }
+        }
+
+        // Compute y_values in-place
+        for (i, (&g, &r)) in n_g.iter().zip(n_r.iter()).enumerate() {
+            let r_safe = if r == 0 { 1 } else { r };
+            y_values[i] = n_clone_f64 * (g as f64 / r_safe as f64);
+        }
 
         let delta_func = |z| interp(&x_values, &y_values, z, &InterpMode::Constant(1.));
 
@@ -274,15 +288,18 @@ pub fn generate_randoms(
             .map(|(&v, &v_dc)| n_clone_f64 * v / v_dc)
             .collect();
 
-        randoms = redshifts
-            .par_iter()
-            .zip(max_zs.par_iter())
-            .zip(n_new.par_iter())
-            .flat_map(|((&z, &z_max), &n)| populate_volume(z, z_max, n, &z_vals, &covol))
-            .collect();
+        // Reuse the randoms vector allocation
+        randoms.clear();
+        randoms.par_extend(
+            redshifts
+                .par_iter()
+                .zip(max_zs.par_iter())
+                .zip(n_new.par_iter())
+                .flat_map(|((&z, &z_max), &n)| populate_volume(z, z_max, n, &z_vals, &covol)),
+        );
     }
 
-    // Filter out any randoms that are exactly at z_lim to avoid boundary pileup
+    // Filter out boundary values
     let epsilon = 1e-10;
     randoms.retain(|&z| z < z_lim - epsilon);
 

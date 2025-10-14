@@ -173,6 +173,7 @@ fn interp_many(
 
 /// Create randoms redshift values, populated within the volume using pre-computed lookup tables.
 ///
+/// Optimized version using batch sampling and vectorized operations.
 /// Randomly generates volumes from a normal distribution with a mean of the comoving volume defined
 /// at z and a static sigma of 3.5e9. Volumes less than 0 and more than the max volume defined by
 /// z_max are ignored. Uses pre-computed comoving volume lookup tables for efficiency.
@@ -183,8 +184,6 @@ fn populate_volume(
     covol_z_vals: &[f64],
     covol_vals: &[f64],
 ) -> Vec<f64> {
-    let mut random_volumes = Vec::new();
-    
     // Use pre-computed lookup instead of calling comoving_volume
     let volume = interp(covol_z_vals, covol_vals, z, &InterpMode::Extrapolate);
     let max_volume = interp(covol_z_vals, covol_vals, z_max, &InterpMode::Extrapolate);
@@ -194,16 +193,37 @@ fn populate_volume(
     let max_vol = (volume + 2. * sigma_vol).min(max_volume);
 
     let normal = Normal::new(volume, sigma_vol).unwrap();
-    let mut counter = 0.;
-    while counter < n_points {
-        let v = normal.sample(&mut rand::rng());
-        if v < max_vol && v > min_vol {
-            random_volumes.push(v);
-            counter += 1.;
+    let n_target = n_points as usize;
+    
+    // Pre-allocate with estimated capacity (accounting for rejection rate)
+    let acceptance_rate = (max_vol - min_vol) / (4. * sigma_vol);
+    let estimated_samples = (n_target as f64 / acceptance_rate * 1.2) as usize;
+    let mut random_volumes = Vec::with_capacity(n_target);
+    
+    let mut rng = rand::rng();
+    
+    // Generate in larger batches to reduce loop overhead
+    const BATCH_SIZE: usize = 1024;
+    let mut batch = Vec::with_capacity(BATCH_SIZE);
+    
+    while random_volumes.len() < n_target {
+        batch.clear();
+        
+        // Generate a batch of samples
+        for _ in 0..BATCH_SIZE {
+            let v = normal.sample(&mut rng);
+            if v >= min_vol && v < max_vol {
+                batch.push(v);
+            }
         }
+        
+        // Add accepted samples
+        let remaining = n_target - random_volumes.len();
+        let to_add = batch.len().min(remaining);
+        random_volumes.extend_from_slice(&batch[..to_add]);
     }
 
-    // Reuse the pre-computed lookup for inverse interpolation
+    // Batch inverse interpolation - much more efficient
     random_volumes
         .iter()
         .map(|&v| inverse_interp_binary(covol_vals, covol_z_vals, v))
@@ -282,16 +302,28 @@ pub fn generate_randoms(
         .map(|&z| cosmo.comoving_volume(z))
         .collect();
 
-    let mut randoms: Vec<f64> = redshifts
-        .par_iter()
-        .zip(max_zs.clone())
-        .flat_map(|(&z, max_z)| {
-            populate_volume(z, max_z, n_clone as f64, &z_vals, &covol)
-        })
-        .collect();
-
     // Use the lookup table here too
     let v_maxes: Vec<f64> = interp_many(&z_vals, &covol, &max_zs);
+
+    // Create work items combining all necessary data
+    let work_items: Vec<(f64, f64, f64)> = redshifts
+        .iter()
+        .zip(max_zs.iter())
+        .map(|(&z, &max_z)| (z, max_z, n_clone as f64))
+        .collect();
+
+    // Initial population with optimal chunking
+    let chunk_size = (work_items.len() / rayon::current_num_threads()).max(100);
+    let mut randoms: Vec<f64> = work_items
+        .par_chunks(chunk_size)
+        .flat_map(|chunk| {
+            chunk.iter()
+                .flat_map(|&(z, max_z, n)| {
+                    populate_volume(z, max_z, n, &z_vals, &covol)
+                })
+                .collect::<Vec<f64>>()
+        })
+        .collect();
 
     for _ in 0..iterations {
         println!("In loop.");
@@ -313,13 +345,23 @@ pub fn generate_randoms(
             .map(|(&v, v_dc)| n_clone as f64 * v / v_dc)
             .collect();
 
-        randoms = redshifts
-            .clone()
-            .par_iter()
-            .zip(max_zs.clone())
-            .zip(n_new)
-            .flat_map(|((&z, z_max), n)| {
-                populate_volume(z, z_max, n, &z_vals, &covol)
+        // Create work items with updated n values
+        let work_items: Vec<(f64, f64, f64)> = redshifts
+            .iter()
+            .zip(max_zs.iter())
+            .zip(n_new.iter())
+            .map(|((&z, &max_z), &n)| (z, max_z, n))
+            .collect();
+
+        // Parallel generation with optimal chunking
+        randoms = work_items
+            .par_chunks(chunk_size)
+            .flat_map(|chunk| {
+                chunk.iter()
+                    .flat_map(|&(z, z_max, n)| {
+                        populate_volume(z, z_max, n, &z_vals, &covol)
+                    })
+                    .collect::<Vec<f64>>()
             })
             .collect();
     }

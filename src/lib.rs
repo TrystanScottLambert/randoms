@@ -189,7 +189,7 @@ fn populate_volume(
     let volume = interp(covol_z_vals, covol_vals, z, &InterpMode::Extrapolate);
     let max_volume = interp(covol_z_vals, covol_vals, z_max, &InterpMode::Extrapolate);
     
-    let sigma_vol = 3.5e9;
+    let sigma_vol = 3.5e10;
     let min_vol = (volume - 2. * sigma_vol).max(0.0);
     let max_vol = (volume + 2. * sigma_vol).min(max_volume);
 
@@ -294,6 +294,8 @@ pub fn generate_randoms(
     let v_maxes: Vec<f64> = interp_many(&z_vals, &covol, &max_zs);
 
     for _ in 0..iterations {
+        println!("In loop.");
+        dbg!(redshifts.len());
         let x_values = approximate_delta_x(redshift_bins.clone());
         let y_values = approximate_delta_y(
             redshifts.clone(),

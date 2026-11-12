@@ -1,362 +1,703 @@
 //! # randoms
 //!
-//! randoms is a crate to generate random catalogues of galaxies from redshift surveys in order
-//! to better model the selction function of these surveys and remove the underlying large-scale
-//! structure. This is essential for things like studying clustering and modelling the n(z) for
-//! group finding.
+//! Generate random (unclustered) catalogues for magnitude-limited redshift surveys, using the
+//! density-corrected V_max cloning method of Cole (2011), optionally with the Gaussian
+//! "windowed clones" modification of Farrow et al. (2015, §3.1.2).
+//!
+//! Outline (Cole 2011 §2-4, Farrow 2015 §3.1):
+//! 1. For each galaxy compute its absolute magnitude (with k+e corrections) and the redshift
+//!    range [z_min,i, z_max,i] over which it would satisfy the survey magnitude limits.
+//! 2. Each galaxy distributes its clones over that range in P-weighted volume, either uniformly
+//!    (Cole) or with a reflected Gaussian window around its own position (Farrow). This gives,
+//!    for each galaxy, the fraction f_ip of its clones expected in each redshift bin p.
+//! 3. Iterate the radial overdensity Delta_p:
+//!    w_i = 1 / <Delta>_i with <Delta>_i = sum_p f_ip Delta_p (= V_dc,max / V_max for the
+//!    uniform window), normalised so <w> = 1 (Cole's normalisation constraint, with mu = 0);
+//!    expected random counts n_r,p = n_clone sum_i w_i f_ip; Delta_p = n_clone n_g,p / n_r,p
+//!    (Farrow eq. 7), optionally shrunk towards 1 with the Cole eq. 18 J3 prior.
+//! 4. Clone each galaxy n_clone * w_i times (stochastic rounding, Cole footnote 4) and place
+//!    each clone by drawing from its window, recomputing the apparent magnitude at the new z.
+//!
+//! The expected n_r is computed analytically (as in the Fortran `estimate_nofz`) rather than
+//! from Monte Carlo randoms each iteration, so the iteration is noise-free and cheap; the
+//! Monte Carlo catalogue is drawn once at the end.
 
+pub mod config;
 pub mod constants;
 pub mod cosmology;
-pub mod histogram;
+pub mod model;
+pub mod tables;
+pub mod window;
 
-use interp::{InterpMode, interp};
-use libm::log10;
-use rand::Rng;
-use rand::SeedableRng;
-use rand::rngs::SmallRng;
+use std::fmt;
+
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
-use statrs::distribution::{ContinuousCDF, Normal as StatrsNormal};
-use std::f64::consts::PI;
 
-use crate::cosmology::Cosmology;
-use crate::histogram::{arange, calculate_fd, histogram, linspace};
+pub use crate::model::{DensityEvolution, ECorrection, KCorrection, Model};
+pub use crate::tables::DistanceTable;
+pub use crate::window::{Sigma, Window};
+use crate::window::{NormalQuadrature, fold, truncated_standard_normal};
 
-/// Calcuates the redshift at which the current galaxy with magntidue mag and redshift z would be visible.
-fn calculate_max_z(mag: f64, z: f64, mag_lim: f64, cosmo: &Cosmology) -> f64 {
-    let distance_measured = cosmo.luminosity_distance(z) * 1e6;
-    let max_distance = 10_f64.powf((mag_lim - mag + 5. * log10(distance_measured)) / 5.);
-    cosmo.inverse_lumdist(max_distance / 1e6)
+/// Survey selection.
+#[derive(Debug, Clone)]
+pub struct Survey {
+    pub zmin: f64,
+    pub zmax: f64,
+    /// Faint apparent-magnitude limit.
+    pub mag_faint: f64,
+    /// Optional bright apparent-magnitude limit.
+    pub mag_bright: Option<f64>,
+    /// Survey solid angle in steradians. Only affects the absolute volume units (and so the
+    /// meaning of `Sigma::Volume` and `four_pi_j3`).
+    pub solid_angle_sr: f64,
 }
 
-/// Batch calculation of density corrected volumes for multiple z_max values
-fn calculate_v_dc_max_batch<F: Fn(f64) -> f64 + Sync>(
-    max_zs: &[f64],
-    delta_z: F,
-    cosmo: &Cosmology,
-) -> Vec<f64> {
-    if max_zs.is_empty() {
-        return vec![];
+/// Algorithm settings.
+#[derive(Debug, Clone)]
+pub struct RandomsConfig {
+    /// Target ratio of randoms to galaxies.
+    pub n_clone: f64,
+    /// Number of uniform redshift bins between survey zmin and zmax used for Delta(z).
+    pub nzbin: usize,
+    pub max_iter: usize,
+    /// Convergence when max |Delta_new - Delta_old| < tol.
+    pub tol: f64,
+    pub seed: u64,
+    pub window: Window,
+    /// Optional 4 pi J3 (Cole 2011 eq. 18) clustering prior on Delta, in the volume units of the
+    /// table ((Mpc/h)^3 for h0 = 100). `None` = raw estimate (Farrow 2015 eq. 7).
+    pub four_pi_j3: Option<f64>,
+    /// Number of points in the redshift lookup table.
+    pub table_points: usize,
+    /// Number of quadrature points across the Gaussian window.
+    pub window_quadrature_points: usize,
+}
+
+impl Default for RandomsConfig {
+    fn default() -> Self {
+        RandomsConfig {
+            n_clone: 400.,
+            nzbin: 40,
+            max_iter: 1000,
+            tol: 1e-4,
+            seed: 42,
+            window: Window::Uniform,
+            four_pi_j3: None,
+            table_points: 20001,
+            window_quadrature_points: 400,
+        }
     }
+}
 
-    let max_limit = max_zs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let xs = linspace(0., max_limit, 1000);
-    let bin_size = xs[1] - xs[0];
+/// Derived per-galaxy quantities.
+#[derive(Debug, Clone, Copy)]
+pub struct GalaxyProps {
+    pub absmag: f64,
+    /// Redshift range over which the galaxy satisfies the selection.
+    pub zmin: f64,
+    pub zmax: f64,
+    /// P-weighted accessible volume, V_max.
+    pub vmax: f64,
+    /// Final clone weight w_i (mean 1); expected clones = n_clone * w_i.
+    pub weight: f64,
+}
 
-    let ys: Vec<f64> = xs
-        .par_iter()
-        .map(|&z| delta_z(z) * cosmo.differential_comoving_distance(z))
-        .collect();
+/// The random catalogue (struct-of-arrays).
+#[derive(Debug, Clone, Default)]
+pub struct Randoms {
+    pub z: Vec<f64>,
+    /// Apparent magnitude of the clone at its new redshift.
+    pub mag: Vec<f64>,
+    /// Index of the parent galaxy in the input arrays.
+    pub parent: Vec<usize>,
+}
 
-    let mut cumsum = Vec::with_capacity(ys.len());
-    let mut sum = 0.0;
-    for &y in &ys {
-        sum += y * bin_size;
-        cumsum.push(sum);
+impl Randoms {
+    pub fn len(&self) -> usize {
+        self.z.len()
     }
+    pub fn is_empty(&self) -> bool {
+        self.z.is_empty()
+    }
+}
 
-    max_zs
-        .par_iter()
-        .map(|&limit| {
-            if limit <= 0.0 {
-                return 0.0;
+/// The radial overdensity solution.
+#[derive(Debug, Clone)]
+pub struct DeltaBins {
+    /// nzbin + 1 bin edges in redshift.
+    pub z_edges: Vec<f64>,
+    /// Galaxies per bin.
+    pub n_gal: Vec<f64>,
+    /// Expected randoms per bin divided by n_clone (directly comparable to n_gal).
+    pub n_ran: Vec<f64>,
+    pub delta: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RandomsResult {
+    pub randoms: Randoms,
+    pub galaxies: Vec<GalaxyProps>,
+    pub bins: DeltaBins,
+    /// max |Delta change| for each iteration.
+    pub delta_change: Vec<f64>,
+    pub converged: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RandomsError(pub String);
+
+impl fmt::Display for RandomsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for RandomsError {}
+
+fn err<T>(msg: impl Into<String>) -> Result<T, RandomsError> {
+    Err(RandomsError(msg.into()))
+}
+
+/// Sparse per-galaxy bin fractions, CSR layout.
+struct BinFractions {
+    offsets: Vec<usize>,
+    bins: Vec<u32>,
+    fracs: Vec<f64>,
+}
+
+impl BinFractions {
+    fn row(&self, i: usize) -> impl Iterator<Item = (usize, f64)> + '_ {
+        let (a, b) = (self.offsets[i], self.offsets[i + 1]);
+        self.bins[a..b]
+            .iter()
+            .zip(&self.fracs[a..b])
+            .map(|(&p, &f)| (p as usize, f))
+    }
+}
+
+fn bin_of(edges: &[f64], x: f64) -> usize {
+    let nb = edges.len() - 1;
+    edges
+        .partition_point(|&e| e <= x)
+        .saturating_sub(1)
+        .min(nb - 1)
+}
+
+/// Per-galaxy geometry in P-weighted volume.
+#[derive(Clone, Copy)]
+struct Geometry {
+    absmag: f64,
+    zlo: f64,
+    zhi: f64,
+    ulo: f64,
+    uhi: f64,
+    ucen: f64,
+}
+
+fn window_fractions(
+    g: &Geometry,
+    window: &ResolvedWindow,
+    u_edges: &[f64],
+    quad: Option<&NormalQuadrature>,
+) -> Vec<(u32, f64)> {
+    let len = g.uhi - g.ulo;
+    if len <= 0. {
+        return vec![(bin_of(u_edges, g.ucen) as u32, 1.)];
+    }
+    let p0 = bin_of(u_edges, g.ulo);
+    let p1 = bin_of(u_edges, g.uhi);
+    match window {
+        ResolvedWindow::Uniform => (p0..=p1)
+            .filter_map(|p| {
+                let ov = g.uhi.min(u_edges[p + 1]) - g.ulo.max(u_edges[p]);
+                (ov > 0.).then_some((p as u32, ov / len))
+            })
+            .collect(),
+        ResolvedWindow::Gaussian { sigma, .. } => {
+            let quad = quad.expect("quadrature for gaussian window");
+            let mut acc = vec![0.; p1 - p0 + 1];
+            for (&t, &w) in quad.nodes.iter().zip(&quad.weights) {
+                let x = fold(g.ucen + sigma * t, g.ulo, g.uhi);
+                acc[bin_of(u_edges, x).clamp(p0, p1) - p0] += w;
             }
-            if limit >= max_limit {
-                return cumsum.last().unwrap() * 4.0 * PI;
+            acc.into_iter()
+                .enumerate()
+                .filter(|&(_, f)| f > 0.)
+                .map(|(k, f)| ((p0 + k) as u32, f))
+                .collect()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResolvedWindow {
+    Uniform,
+    Gaussian { sigma: f64, truncate: f64 },
+}
+
+impl ResolvedWindow {
+    fn sample<R: Rng>(&self, g: &Geometry, rng: &mut R) -> f64 {
+        match *self {
+            ResolvedWindow::Uniform => g.ulo + (g.uhi - g.ulo) * rng.random::<f64>(),
+            ResolvedWindow::Gaussian { sigma, truncate } => {
+                let t = truncated_standard_normal(truncate, rng);
+                fold(g.ucen + sigma * t, g.ulo, g.uhi)
             }
-
-            let idx = ((limit / max_limit) * (xs.len() - 1) as f64) as usize;
-            let idx = idx.min(cumsum.len() - 1);
-
-            let v_dc = if idx < cumsum.len() - 1 {
-                let x0 = xs[idx];
-                let x1 = xs[idx + 1];
-                let y0 = cumsum[idx];
-                let y1 = cumsum[idx + 1];
-                y0 + (y1 - y0) * (limit - x0) / (x1 - x0)
-            } else {
-                cumsum[idx]
-            };
-
-            v_dc * 4.0 * PI
-        })
-        .collect()
-}
-
-fn _reflect_into_range(value: f64, min_value: f64, max_value: f64) -> f64 {
-    let mut v = value;
-    // Keep reflecting until within bounds
-    loop {
-        if v < min_value {
-            v = 2.0 * min_value - v;
-        } else if v > max_value {
-            v = 2.0 * max_value - v;
-        } else {
-            return v;
-        }
-        // Safety check to avoid infinite loops
-        if (v - value).abs() > 10.0 * (max_value - min_value) {
-            return value.max(min_value).min(max_value);
         }
     }
 }
 
-fn interp_many(x_vals: &[f64], y_vals: &[f64], queries: &[f64]) -> Vec<f64> {
-    assert_eq!(
-        x_vals.len(),
-        y_vals.len(),
-        "x_vals and y_vals length mismatch"
-    );
-
-    let mut indexed: Vec<(usize, f64)> = queries.iter().cloned().enumerate().collect();
-    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-    let mut results = vec![0.0; queries.len()];
-    let mut i = 1;
-
-    for (orig_idx, qx) in indexed {
-        while i < x_vals.len() && x_vals[i] < qx {
-            i += 1;
-        }
-
-        let val = if i == 0 {
-            y_vals[0]
-        } else if i >= x_vals.len() {
-            y_vals[y_vals.len() - 1]
-        } else {
-            let x0 = x_vals[i - 1];
-            let x1 = x_vals[i];
-            let y0 = y_vals[i - 1];
-            let y1 = y_vals[i];
-            y0 + (y1 - y0) * (qx - x0) / (x1 - x0)
-        };
-
-        results[orig_idx] = val;
+/// Solve the Cole quadratic 0 = -delta_raw + delta + f delta (delta - 1) (Fortran
+/// `estimate_delta`), which shrinks delta towards 1 where the expected fluctuations are large.
+fn shrink_delta(delta_raw: f64, f: f64) -> f64 {
+    if f > 5e-4 {
+        (f - 1. + ((1. - f).powi(2) + 4. * f * delta_raw).sqrt()) / (2. * f)
+    } else {
+        delta_raw + f * (delta_raw - delta_raw * delta_raw)
     }
-
-    results
 }
 
-/// Sample from truncated normal distribution using statrs for CDF/inverse CDF
-/// Uses parallel sampling with thread-local RNGs for performance
-fn truncated_normal(mu: f64, sigma: f64, a: f64, b: f64, n: usize) -> Vec<f64> {
-    if n == 0 {
-        return Vec::new();
-    }
-
-    let normal = StatrsNormal::new(mu, sigma).unwrap();
-    let pa = normal.cdf(a);
-    let pb = normal.cdf(b);
-
-    (0..n)
-        .into_par_iter()
-        .map_init(
-            || SmallRng::from_rng(&mut rand::rng()),
-            |rng, _| {
-                let u = rng.random_range(pa..pb);
-                normal.inverse_cdf(u)
-            },
-        )
-        .collect()
-}
-
-/// Optimized populate_volume using proper truncated normal distribution
-fn populate_volume(
-    z: f64,
-    z_max: f64,
-    n_points: f64,
-    covol_z_vals: &[f64],
-    covol_vals: &[f64],
-) -> Vec<f64> {
-    let n_target = n_points as usize;
-    if n_target == 0 {
-        return Vec::new();
-    }
-
-    let volume = interp(covol_z_vals, covol_vals, z, &InterpMode::Extrapolate);
-    let max_volume = interp(covol_z_vals, covol_vals, z_max, &InterpMode::Extrapolate);
-
-    let sigma_vol = 0.33 * max_volume; //3.5e9;
-
-    // Truncate at ±2σ
-    let lower = (volume - 2.0 * sigma_vol).max(0.0);
-    let upper = (volume + 2.0 * sigma_vol).min(max_volume);
-
-    // Handle edge cases
-    if upper <= lower {
-        let v = lower.max(0.0).min(max_volume);
-        let zs = vec![v; n_target];
-        return interp_many(covol_vals, covol_z_vals, &zs);
-    }
-
-    // Use truncated normal sampling
-    let volumes = truncated_normal(volume, sigma_vol, lower, upper, n_target);
-
-    // Convert volumes to redshifts in one vectorized pass
-    interp_many(covol_vals, covol_z_vals, &volumes)
-}
-
-fn approximate_delta_x(redshift_bins: &[f64]) -> Vec<f64> {
-    redshift_bins
-        .windows(2)
-        .map(|b| (b[0] + b[1]) / 2.)
-        .collect()
-}
-
-/// Main function which generates the randoms vector of the survey (OPTIMIZED)
+/// Generate a random catalogue.
+///
+/// `z` and `mag` are the redshifts and apparent magnitudes (in the selection band) of the
+/// galaxies. Every galaxy must lie within the survey selection (`zmin <= z <= zmax`,
+/// `mag_bright <= mag <= mag_faint`); filter beforehand.
 pub fn generate_randoms(
-    redshifts: Vec<f64>,
-    mags: Vec<f64>,
-    z_lim: f64,
-    maglim: f64,
-    n_clone: i32,
-    iterations: i32,
-    cosmo: Cosmology,
-) -> Vec<f64> {
-    let bin_width = calculate_fd(redshifts.clone());
-    let redshift_bins = arange(0., z_lim, bin_width);
-
-    // Pre-compute x_values once
-    let x_values = approximate_delta_x(&redshift_bins);
-
-    // Pre-compute n_g once
-    let n_g = histogram(&redshifts, &redshift_bins);
-
-    let max_zs: Vec<f64> = redshifts
-        .par_iter()
-        .zip(mags.par_iter())
-        .map(|(&z, &m)| calculate_max_z(m, z, maglim, &cosmo))
-        .collect();
-
-    // PRE-COMPUTE comoving volume lookup table ONCE
-    let z_vals = linspace(0., z_lim, 1000);
-    let covol: Vec<f64> = z_vals
-        .par_iter()
-        .map(|&z| cosmo.comoving_volume(z))
-        .collect();
-
-    // PRE-COMPUTE v_maxes ONCE (doesn't change across iterations)
-    let v_maxes: Vec<f64> = interp_many(&z_vals, &covol, &max_zs);
-    let n_clone_f64 = n_clone as f64;
-
-    // Initialize randoms vector with capacity
-    let initial_capacity = (redshifts.len() * n_clone as usize * 3) / 2;
-    let mut randoms: Vec<f64> = Vec::with_capacity(initial_capacity);
-
-    // Initial population
-    randoms.par_extend(
-        redshifts
-            .par_iter()
-            .zip(max_zs.par_iter())
-            .flat_map(|(&z, &max_z)| populate_volume(z, max_z, n_clone_f64, &z_vals, &covol)),
-    );
-
-    // Reusable buffers
-    let mut n_r = vec![0i32; redshift_bins.len() - 1];
-    let mut y_values = vec![0.0; x_values.len()];
-
-    for _ in 0..iterations {
-
-        // Compute histogram in-place (no clone!)
-        n_r.fill(0);
-        let bin_width_val = redshift_bins[1] - redshift_bins[0];
-        let min_val = redshift_bins[0];
-        let max_val = redshift_bins[redshift_bins.len() - 1];
-
-        for &value in &randoms {
-            if value >= min_val && value < max_val {
-                let idx = ((value - min_val) / bin_width_val) as usize;
-                if idx < n_r.len() {
-                    n_r[idx] += 1;
-                }
-            }
-        }
-
-        // Compute y_values in-place
-        for (i, (&g, &r)) in n_g.iter().zip(n_r.iter()).enumerate() {
-            let r_safe = if r == 0 { 1 } else { r };
-            y_values[i] = n_clone_f64 * (g as f64 / r_safe as f64);
-        }
-
-        let delta_func = |z| interp(&x_values, &y_values, z, &InterpMode::Constant(1.));
-
-        let v_dc_maxes = calculate_v_dc_max_batch(&max_zs, delta_func, &cosmo);
-
-        let n_new: Vec<f64> = v_maxes
-            .par_iter()
-            .zip(v_dc_maxes.par_iter())
-            .map(|(&v, &v_dc)| n_clone_f64 * v / v_dc)
-            .collect();
-
-        // Reuse the randoms vector allocation
-        randoms.clear();
-        randoms.par_extend(
-            redshifts
-                .par_iter()
-                .zip(max_zs.par_iter())
-                .zip(n_new.par_iter())
-                .flat_map(|((&z, &z_max), &n)| populate_volume(z, z_max, n, &z_vals, &covol)),
-        );
+    z: &[f64],
+    mag: &[f64],
+    survey: &Survey,
+    model: &Model,
+    cfg: &RandomsConfig,
+) -> Result<RandomsResult, RandomsError> {
+    // ---- validation -------------------------------------------------------------------
+    if z.len() != mag.len() {
+        return err("z and mag have different lengths");
+    }
+    if z.is_empty() {
+        return err("empty catalogue");
+    }
+    if !(survey.zmax > survey.zmin && survey.zmin >= 0.) {
+        return err("need 0 <= survey.zmin < survey.zmax");
+    }
+    if cfg.nzbin == 0 || cfg.n_clone <= 0. || cfg.table_points < 2 {
+        return err("nzbin, n_clone and table_points must be positive");
+    }
+    let eps = 1e-9;
+    let bad = z
+        .iter()
+        .zip(mag)
+        .filter(|&(&zi, &mi)| {
+            !(zi.is_finite() && mi.is_finite())
+                || zi < survey.zmin
+                || zi > survey.zmax
+                || mi > survey.mag_faint + eps
+                || survey.mag_bright.is_some_and(|b| mi < b - eps)
+        })
+        .count();
+    if bad > 0 {
+        return err(format!(
+            "{bad} galaxies are outside the survey selection (z in [{}, {}], mag limits) or \
+             non-finite; filter them before calling generate_randoms",
+            survey.zmin, survey.zmax
+        ));
     }
 
-    // Filter out boundary values
-    let epsilon = 1e-10;
-    randoms.retain(|&z| z < z_lim - epsilon);
+    // ---- tables and bins -----------------------------------------------------------------
+    let table = DistanceTable::new(model, survey.zmax, survey.solid_angle_sr, cfg.table_points);
+    let nb = cfg.nzbin;
+    let z_edges: Vec<f64> = (0..=nb)
+        .map(|p| survey.zmin + (survey.zmax - survey.zmin) * p as f64 / nb as f64)
+        .collect();
+    let u_edges: Vec<f64> = z_edges.iter().map(|&ze| table.pvolume_at(ze)).collect();
+    let survey_u = u_edges[nb] - u_edges[0];
 
-    randoms
+    let window = match cfg.window {
+        Window::Uniform => ResolvedWindow::Uniform,
+        Window::Gaussian { sigma, truncate } => {
+            let sigma = match sigma {
+                Sigma::Volume(v) => v,
+                Sigma::FractionOfSurvey(f) => f * survey_u,
+            };
+            if !(sigma > 0. && truncate > 0.) {
+                return err("gaussian window needs sigma > 0 and truncate > 0");
+            }
+            ResolvedWindow::Gaussian { sigma, truncate }
+        }
+    };
+    let quad = match window {
+        ResolvedWindow::Gaussian { truncate, .. } => Some(NormalQuadrature::new(
+            truncate,
+            cfg.window_quadrature_points.max(16),
+        )),
+        ResolvedWindow::Uniform => None,
+    };
+
+    // ---- per-galaxy geometry ----------------------------------------------------------
+    let u_survey_min = u_edges[0];
+    let geom: Vec<Geometry> = z
+        .par_iter()
+        .zip(mag.par_iter())
+        .map(|(&zi, &mi)| {
+            let absmag = mi - table.mag_offset_at(zi);
+            // clamp so the galaxy's own redshift is always inside its range (guards against
+            // interpolation round-off for galaxies right at the limit)
+            let zhi = table.limit_z(absmag, survey.mag_faint).min(survey.zmax).max(zi);
+            let zlo = survey
+                .mag_bright
+                .map_or(0., |b| table.limit_z(absmag, b))
+                .max(survey.zmin)
+                .min(zi);
+            let ulo = table.pvolume_at(zlo).max(u_survey_min);
+            let uhi = table.pvolume_at(zhi);
+            let ucen = table.pvolume_at(zi).clamp(ulo, uhi);
+            Geometry {
+                absmag,
+                zlo,
+                zhi,
+                ulo,
+                uhi,
+                ucen,
+            }
+        })
+        .collect();
+
+    let mut n_gal = vec![0.; nb];
+    for &zi in z {
+        n_gal[bin_of(&z_edges, zi)] += 1.;
+    }
+
+    // ---- bin fractions (geometry only, independent of Delta) ----------------------------
+    let rows: Vec<Vec<(u32, f64)>> = geom
+        .par_iter()
+        .map(|g| window_fractions(g, &window, &u_edges, quad.as_ref()))
+        .collect();
+    let mut fr = BinFractions {
+        offsets: Vec::with_capacity(rows.len() + 1),
+        bins: Vec::new(),
+        fracs: Vec::new(),
+    };
+    fr.offsets.push(0);
+    for row in rows {
+        for (p, f) in row {
+            fr.bins.push(p);
+            fr.fracs.push(f);
+        }
+        fr.offsets.push(fr.bins.len());
+    }
+
+    // ---- iterate Delta ------------------------------------------------------------------
+    let ngal = z.len();
+    let bin_volume: Vec<f64> = (0..nb)
+        .map(|p| table.volume_at(z_edges[p + 1]) - table.volume_at(z_edges[p]))
+        .collect();
+
+    let weights_for = |delta: &[f64]| -> Vec<f64> {
+        let mut w: Vec<f64> = (0..ngal)
+            .into_par_iter()
+            .map(|i| {
+                let md: f64 = fr.row(i).map(|(p, f)| f * delta[p]).sum();
+                if md > 0. { 1. / md } else { 1. }
+            })
+            .collect();
+        let mean = w.iter().sum::<f64>() / ngal as f64;
+        w.iter_mut().for_each(|x| *x /= mean);
+        w
+    };
+    let expected_nran = |w: &[f64]| -> Vec<f64> {
+        // data-normalised: sum = ngal
+        (0..ngal)
+            .into_par_iter()
+            .fold(
+                || vec![0.; nb],
+                |mut acc, i| {
+                    for (p, f) in fr.row(i) {
+                        acc[p] += w[i] * f;
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.; nb],
+                |mut a, b| {
+                    a.iter_mut().zip(b).for_each(|(x, y)| *x += y);
+                    a
+                },
+            )
+    };
+
+    let mut delta = vec![1.; nb];
+    let mut delta_change = Vec::new();
+    let mut converged = false;
+    for _ in 0..cfg.max_iter {
+        let w = weights_for(&delta);
+        let n_ran = expected_nran(&w);
+        let new: Vec<f64> = (0..nb)
+            .map(|p| {
+                if n_ran[p] <= 0. {
+                    return 1.;
+                }
+                let raw = n_gal[p] / n_ran[p];
+                match cfg.four_pi_j3 {
+                    None => raw,
+                    Some(j3) => {
+                        // f = 1 / (sigma^2 n_ran), sigma^2 = (1 + n_ran J3 / V) / n_ran
+                        let f = 1. / (1. + n_ran[p] * j3 / bin_volume[p]);
+                        shrink_delta(raw, f)
+                    }
+                }
+            })
+            .collect();
+        let change = new
+            .iter()
+            .zip(&delta)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0., f64::max);
+        delta = new;
+        delta_change.push(change);
+        if change < cfg.tol {
+            converged = true;
+            break;
+        }
+    }
+
+    let w = weights_for(&delta);
+    let n_ran = expected_nran(&w);
+
+    // ---- generate the clones ------------------------------------------------------------
+    let clones: Vec<Vec<(f64, f64)>> = (0..ngal)
+        .into_par_iter()
+        .map(|i| {
+            let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed);
+            rng.set_stream(i as u64);
+            let target = cfg.n_clone * w[i];
+            let base = target.floor();
+            let nrep = base as usize + usize::from(rng.random::<f64>() < target - base);
+            let g = &geom[i];
+            (0..nrep)
+                .map(|_| {
+                    let u = window.sample(g, &mut rng);
+                    let zc = table.z_at_pvolume(u).clamp(g.zlo, g.zhi);
+                    (zc, g.absmag + table.mag_offset_at(zc))
+                })
+                .collect()
+        })
+        .collect();
+
+    let total: usize = clones.iter().map(Vec::len).sum();
+    let mut randoms = Randoms {
+        z: Vec::with_capacity(total),
+        mag: Vec::with_capacity(total),
+        parent: Vec::with_capacity(total),
+    };
+    for (i, c) in clones.into_iter().enumerate() {
+        for (zc, mc) in c {
+            randoms.z.push(zc);
+            randoms.mag.push(mc);
+            randoms.parent.push(i);
+        }
+    }
+
+    let galaxies = geom
+        .iter()
+        .zip(&w)
+        .map(|(g, &wi)| GalaxyProps {
+            absmag: g.absmag,
+            zmin: g.zlo,
+            zmax: g.zhi,
+            vmax: g.uhi - g.ulo,
+            weight: wi,
+        })
+        .collect();
+
+    Ok(RandomsResult {
+        randoms,
+        galaxies,
+        bins: DeltaBins {
+            z_edges,
+            n_gal,
+            n_ran,
+            delta,
+        },
+        delta_change,
+        converged,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cosmology::Cosmology;
 
-    #[test]
-    fn test_max_z() {
-        let mag = 19.8;
-        let mag_lim = 19.8;
-        let z = 0.2;
-        let cosmo = Cosmology {
+    fn model() -> Model {
+        Model::new(Cosmology {
             omega_m: 0.3,
             omega_k: 0.,
             omega_l: 0.7,
             h0: 100.,
+        })
+    }
+
+    fn survey() -> Survey {
+        Survey {
+            zmin: 0.01,
+            zmax: 0.4,
+            mag_faint: 19.0,
+            mag_bright: None,
+            solid_angle_sr: 0.05,
+        }
+    }
+
+    /// Unclustered mock: galaxies uniform in volume with a Gaussian LF, optionally with a
+    /// redshift shell boosted by `boost` (a fake overdensity).
+    fn mock(n_target: usize, boost: Option<(f64, f64, f64)>, seed: u64) -> (Vec<f64>, Vec<f64>) {
+        let s = survey();
+        let m = model();
+        let t = DistanceTable::new(&m, s.zmax, s.solid_angle_sr, 20001);
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let (u0, u1) = (t.pvolume_at(s.zmin), t.pvolume_at(s.zmax));
+        let (mut z, mut mag) = (vec![], vec![]);
+        while z.len() < n_target {
+            let zi = t.z_at_pvolume(u0 + (u1 - u0) * rng.random::<f64>());
+            let copies = match boost {
+                Some((a, b, f)) if zi > a && zi < b => {
+                    f.floor() as usize + usize::from(rng.random::<f64>() < f.fract())
+                }
+                _ => 1,
+            };
+            for _ in 0..copies {
+                let absmag: f64 = -20.5 + 1.2 * rng.sample::<f64, _>(rand_distr::StandardNormal);
+                let mi = absmag + t.mag_offset_at(zi);
+                if mi <= s.mag_faint {
+                    z.push(zi);
+                    mag.push(mi);
+                }
+            }
+        }
+        (z, mag)
+    }
+
+    #[test]
+    fn rejects_galaxies_outside_selection() {
+        let r = generate_randoms(
+            &[0.1, 0.5],
+            &[18., 18.],
+            &survey(),
+            &model(),
+            &RandomsConfig::default(),
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn unclustered_mock_gives_flat_delta() {
+        let (z, mag) = mock(40_000, None, 3);
+        let cfg = RandomsConfig {
+            n_clone: 20.,
+            nzbin: 10,
+            ..Default::default()
         };
-        assert!((calculate_max_z(mag, z, mag_lim, &cosmo) - z).abs() < 1e-7);
-
-        let mag = 19.6;
-        assert!((calculate_max_z(mag, z, mag_lim, &cosmo) - 0.21713688).abs() < 1e-5);
+        let r = generate_randoms(&z, &mag, &survey(), &model(), &cfg).unwrap();
+        assert!(r.converged);
+        for (p, d) in r.bins.delta.iter().enumerate() {
+            // within 4 sigma of Poisson noise
+            let tol = 4. / r.bins.n_gal[p].sqrt();
+            assert!((d - 1.).abs() < tol, "bin {p}: delta {d} (n_gal {})", r.bins.n_gal[p]);
+        }
+        let expected = 20. * z.len() as f64;
+        assert!((r.randoms.len() as f64 / expected - 1.).abs() < 0.01);
+        // every random satisfies the selection
+        for (&zc, &mc) in r.randoms.z.iter().zip(&r.randoms.mag) {
+            assert!((0.01..=0.4).contains(&zc));
+            assert!(mc <= 19.0 + 1e-6, "clone mag {mc}");
+        }
     }
 
     #[test]
-    fn test_inverse_interp_binary_exact_match() {
-        let x_vals = [0.0, 1.0, 2.0, 3.0];
-        let y_vals = [0.0, 10.0, 20.0, 30.0];
-        let target = [20.];
-        let result = interp_many(&y_vals, &x_vals, &target);
-        assert!((result[0] - 2.0).abs() < 1e-12);
+    fn recovers_injected_overdensity() {
+        // Double the density in 0.15 < z < 0.2; the randoms should not follow it.
+        let (z, mag) = mock(60_000, Some((0.15, 0.2, 2.0)), 5);
+        let cfg = RandomsConfig {
+            n_clone: 20.,
+            nzbin: 39, // bin width 0.01 so the shell is exactly 5 bins
+            ..Default::default()
+        };
+        let r = generate_randoms(&z, &mag, &survey(), &model(), &cfg).unwrap();
+        let b = &r.bins;
+        let mut inside = vec![];
+        let mut outside = vec![];
+        for p in 0..b.delta.len() {
+            let zc = 0.5 * (b.z_edges[p] + b.z_edges[p + 1]);
+            if zc > 0.15 && zc < 0.2 {
+                inside.push(b.delta[p]);
+            } else if b.n_gal[p] > 500. {
+                outside.push(b.delta[p]);
+            }
+        }
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let ratio = mean(&inside) / mean(&outside);
+        assert!((ratio - 2.).abs() < 0.15, "overdensity ratio {ratio}");
     }
 
     #[test]
-    fn test_inverse_interp_binary_interpolation() {
-        let x_vals = [0.0, 1.0, 2.0, 3.0];
-        let y_vals = [0.0, 10.0, 20.0, 30.0];
-        let result = interp_many(&y_vals, &x_vals, &[15.0]);
-        assert!((result[0] - 1.5).abs() < 1e-12);
+    fn seeded_runs_are_reproducible() {
+        let (z, mag) = mock(3_000, None, 9);
+        let cfg = RandomsConfig {
+            n_clone: 5.,
+            nzbin: 8,
+            window: Window::Gaussian {
+                sigma: Sigma::FractionOfSurvey(0.05),
+                truncate: 2.,
+            },
+            ..Default::default()
+        };
+        let a = generate_randoms(&z, &mag, &survey(), &model(), &cfg).unwrap();
+        let b = generate_randoms(&z, &mag, &survey(), &model(), &cfg).unwrap();
+        assert_eq!(a.randoms.z, b.randoms.z);
+        assert_eq!(a.randoms.parent, b.randoms.parent);
     }
 
     #[test]
-    fn test_inverse_interp_binary_below_range() {
-        let x_vals = [0.0, 1.0, 2.0, 3.0];
-        let y_vals = [0.0, 10.0, 20.0, 30.0];
-        let result = interp_many(&y_vals, &x_vals, &[-5.0]);
-        dbg!("{:?}", result.clone());
-        assert!((result[0] + 0.5).abs() < 1e-12);
+    fn stochastic_rounding_preserves_mean() {
+        let (z, mag) = mock(20_000, None, 11);
+        let cfg = RandomsConfig {
+            n_clone: 2.5,
+            nzbin: 10,
+            ..Default::default()
+        };
+        let r = generate_randoms(&z, &mag, &survey(), &model(), &cfg).unwrap();
+        let expected: f64 = r.galaxies.iter().map(|g| 2.5 * g.weight).sum();
+        let got = r.randoms.len() as f64;
+        // Bernoulli variance <= n/4
+        assert!((got - expected).abs() < 5. * (z.len() as f64 / 4.).sqrt());
     }
 
     #[test]
-    fn test_inverse_interp_binary_above_range() {
-        let x_vals = [0.0, 1.0, 2.0, 3.0];
-        let y_vals = [0.0, 10.0, 20.0, 30.0];
-        let result = interp_many(&y_vals, &x_vals, &[35.0]);
-        assert!((result[0] - 3.0).abs() < 1e-12);
+    fn gaussian_window_keeps_clones_near_parent() {
+        let (z, mag) = mock(10_000, None, 13);
+        let cfg = RandomsConfig {
+            n_clone: 10.,
+            nzbin: 10,
+            window: Window::Gaussian {
+                sigma: Sigma::FractionOfSurvey(0.02),
+                truncate: 2.,
+            },
+            ..Default::default()
+        };
+        let r = generate_randoms(&z, &mag, &survey(), &model(), &cfg).unwrap();
+        let mean_abs_dz: f64 = r
+            .randoms
+            .z
+            .iter()
+            .zip(&r.randoms.parent)
+            .map(|(&zc, &p)| (zc - z[p]).abs())
+            .sum::<f64>()
+            / r.randoms.len() as f64;
+        assert!(mean_abs_dz < 0.03, "mean |dz| {mean_abs_dz}");
+        // and Delta still ~1 for an unclustered mock
+        for (d, n) in r.bins.delta.iter().zip(&r.bins.n_gal) {
+            assert!((d - 1.).abs() < 4. / n.sqrt(), "{:?}", r.bins.delta);
+        }
     }
 }

@@ -1,21 +1,24 @@
-use core::f64;
 use std::f64::consts::PI;
 
 use integrate::adaptive_quadrature;
 use libm::{asin, asinh, log10, sinh};
 use roots::SimpleConvergency;
 use roots::find_root_brent;
+use serde::Deserialize;
 
 use crate::constants::{G, KM_TO_METERS, MPC_TO_METERS, MSOL_TO_KG, PC_TO_METERS, SPEED_OF_LIGHT};
 
 /// Determines the zero point of the root function. This can be used to calcualte the inverse
 /// of cosmological properties, i.e., the z value at which they occur.
+///
+/// Returns `f64::NAN` if no root is found in 0 < z < 1200 (previously this silently returned 0,
+/// which looked like a valid redshift).
 fn inverse(root_function: impl Fn(f64) -> f64) -> f64 {
     let mut convergency = SimpleConvergency {
-        eps: 1e-8f64,
-        max_iter: 30,
+        eps: 1e-10f64,
+        max_iter: 200,
     };
-    find_root_brent(1e-9, 1200., &root_function, &mut convergency).unwrap_or(0.)
+    find_root_brent(1e-9, 1200., &root_function, &mut convergency).unwrap_or(f64::NAN)
 }
 
 /// A Flat lambda CDM cosmology object.
@@ -24,6 +27,7 @@ fn inverse(root_function: impl Fn(f64) -> f64) -> f64 {
 /// @param omega_k Effective mass density of relativistic particles (often 0. in LCDM).
 /// @param omega_l Effective mass density of dark energy (often 0.7 in LCDM).
 /// @param h0 H0 = 100 * h.
+#[derive(Debug, Clone, Deserialize)]
 pub struct Cosmology {
     /// Mass density (often 0.3 in LCDM).
     pub omega_m: f64,
@@ -145,17 +149,20 @@ impl Cosmology {
     /// Returns Mpc^3.
     pub fn comoving_volume(&self, z: f64) -> f64 {
         if self.omega_k == 0. {
-            (4. / 3.) * f64::consts::PI * self.comoving_distance(z).powi(3)
+            (4. / 3.) * PI * self.comoving_distance(z).powi(3)
         } else {
             let dh = self.hubble_distance();
             let dm = self.comoving_transverse_distance(z);
-            let term1 = 4. * f64::consts::PI * (dh.powi(3)) / (2. * self.omega_k);
+            let term1 = 4. * PI * (dh.powi(3)) / (2. * self.omega_k);
             let term2 = dm / dh * (1. + self.omega_k * (dm / dh).powi(2)).sqrt();
-            let term3 = self.omega_k.abs().sqrt() * dm / dh;
+            let sqrt_ok = self.omega_k.abs().sqrt();
+            let term3 = sqrt_ok * dm / dh;
+            // Hogg (1999) eq. 29: the arcsinh/arcsin term is divided by sqrt|Omega_k|, not
+            // multiplied onto the whole bracket.
             if self.omega_k > 0. {
-                term1 * (term2 - 1. / self.omega_k.abs().sqrt()) * asinh(term3)
+                term1 * (term2 - asinh(term3) / sqrt_ok)
             } else {
-                term1 * (term2 - 1. / self.omega_k.abs().sqrt()) * asin(term3)
+                term1 * (term2 - asin(term3) / sqrt_ok)
             }
         }
     }
@@ -379,8 +386,40 @@ mod tests {
 
         // test z=0 edge case
         assert_eq!(cosmo.comoving_volume(0.), 0.)
+    }
 
-        // TODO: add OmK>0 OmK < 0
+    #[test]
+    fn testing_comoving_volume_curved() {
+        // For curved cosmologies compare the closed-form volume against a direct numerical
+        // integral of 4pi * dV/dz/dOmega.
+        for omega_k in [0.1, -0.1] {
+            let cosmo = Cosmology {
+                omega_m: 0.3,
+                omega_k,
+                omega_l: 0.7 - omega_k,
+                h0: 100.,
+            };
+            for z in [0.1, 0.5, 1.0, 2.0] {
+                let n = 4000;
+                let dz = z / n as f64;
+                let mut integral = 0.;
+                for i in 0..n {
+                    let (a, b) = (i as f64 * dz, (i + 1) as f64 * dz);
+                    let m = 0.5 * (a + b);
+                    // Simpson's rule on each sub-interval
+                    integral += dz / 6.
+                        * (cosmo.differential_comoving_distance(a)
+                            + 4. * cosmo.differential_comoving_distance(m)
+                            + cosmo.differential_comoving_distance(b));
+                }
+                let numeric = 4. * PI * integral;
+                let analytic = cosmo.comoving_volume(z);
+                assert!(
+                    (analytic / numeric - 1.).abs() < 1e-4,
+                    "omega_k={omega_k} z={z}: analytic {analytic} numeric {numeric}"
+                );
+            }
+        }
     }
 
     #[test]

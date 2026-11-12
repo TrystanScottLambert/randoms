@@ -1,0 +1,61 @@
+# Randoms for the GAMA DR4 main survey (G09, G12, G15, G23), r < 19.65.
+#
+#   cargo run --release -- configs/gama_dr4.toml
+#
+# Relative paths are resolved against this file's directory.
+
+zref = 0.0
+
+[input]
+path = "../gama_input_galaxies.csv"
+delimiter = ","
+redshift = "Z"
+# flux_rt is in Jy: r_AB = 8.9 - 2.5 log10(flux_rt)
+flux = { column = "flux_rt", zero_point = 8.9 }
+carry = ["CATAID", "RAcen", "Deccen"]
+
+[output]
+randoms = "../gama_randoms.csv"
+delta = "../gama_delta.csv"
+galaxies = "../gama_galaxies_out.csv"
+
+[survey]
+zmin = 0.002
+zmax = 0.6
+mag_faint = 19.65
+solid_angle_deg2 = 240.0 # 4 regions x 12 deg x 5 deg
+
+# h0 = 100 so volumes are in (Mpc/h)^3, matching the Fortran and Farrow et al. (2015).
+[cosmology]
+omega_m = 0.3
+omega_l = 0.7
+h0 = 100.0
+
+# GAMA r-band k(z) from cole_fortran/user_routines.f90: sum_i c_i (z - 0.2)^i
+[kcorrection]
+type = "polynomial"
+coeffs = [0.20848, 1.0226, 0.52366, 3.5902, 2.3843]
+z0 = 0.2
+
+# e(z) = -q z  (Fortran ecorr with u = 0)
+[ecorrection]
+q = 1.75
+
+# P(z) = exp(a z)  (Fortran P with a = 0; note its comment says 0.18 but the code uses 0.1)
+[density_evolution]
+type = "exp"
+a = 0.1
+
+[randoms]
+n_clone = 100
+nzbin = 40
+max_iter = 1000
+tol = 1e-4
+seed = 42
+
+# Farrow et al. (2015) windowed clones: sigma = 3.5e6 (Mpc/h)^3 in GAMA II volume.
+# Use `window = { type = "none" }` for pure Cole (2011) uniform-in-Vmax placement.
+[randoms.window]
+type = "gaussian"
+sigma_volume = 3.5e6
+truncate = 2.0

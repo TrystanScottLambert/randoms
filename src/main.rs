@@ -42,8 +42,13 @@ fn read_catalogue(cfg: &Config) -> Result<Catalogue, Box<dyn Error>> {
         .iter()
         .map(|c| column(&headers, c))
         .collect::<Result<_, _>>()?;
+    let iselect: Vec<(usize, f64, f64)> = inp
+        .select
+        .iter()
+        .map(|s| column(&headers, &s.column).map(|i| (i, s.min, s.max)))
+        .collect::<Result<_, _>>()?;
 
-    let (mut total, mut bad, mut zcut, mut magcut) = (0usize, 0usize, 0usize, 0usize);
+    let (mut total, mut bad, mut zcut, mut magcut, mut unselected) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut cat = Catalogue {
         z: vec![],
         mag: vec![],
@@ -52,6 +57,13 @@ fn read_catalogue(cfg: &Config) -> Result<Catalogue, Box<dyn Error>> {
     for rec in rdr.records() {
         let rec = rec?;
         total += 1;
+        let selected = iselect.iter().all(|&(i, lo, hi)| {
+            rec[i].parse::<f64>().is_ok_and(|v| v >= lo && v <= hi)
+        });
+        if !selected {
+            unselected += 1;
+            continue;
+        }
         let z: f64 = rec[iz].parse().unwrap_or(f64::NAN);
         let raw: f64 = rec[imag].parse().unwrap_or(f64::NAN);
         let mag = match &inp.flux {
@@ -82,7 +94,7 @@ fn read_catalogue(cfg: &Config) -> Result<Catalogue, Box<dyn Error>> {
             .push(icarry.iter().map(|&i| rec[i].to_string()).collect());
     }
     println!(
-        "read {total} rows from {}: kept {}, dropped {bad} unparseable/non-positive flux, \
+        "read {total} rows from {}: kept {}, dropped {unselected} outside `select` ranges, {bad} unparseable/non-positive flux, \
          {zcut} outside {} <= z <= {}, {magcut} outside magnitude limits",
         inp.path.display(),
         cat.z.len(),

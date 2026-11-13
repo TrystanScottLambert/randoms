@@ -44,6 +44,17 @@ pub struct InputConfig {
     /// Extra columns copied from each parent galaxy to its clones.
     #[serde(default)]
     pub carry: Vec<String>,
+    /// Keep only rows with min <= column <= max for every entry (e.g. one survey field).
+    #[serde(default)]
+    pub select: Vec<RangeSelect>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RangeSelect {
+    pub column: String,
+    pub min: f64,
+    pub max: f64,
 }
 
 #[derive(Debug, Deserialize)]
